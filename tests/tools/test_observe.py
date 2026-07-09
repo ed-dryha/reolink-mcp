@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from mcp.server.fastmcp import FastMCP
@@ -36,7 +36,7 @@ from reolink_aio.exceptions import (
 from reolink_mcp.errors import CameraError, UnknownCameraError, classify_reolink_error
 from reolink_mcp.manager import CameraManager
 from reolink_mcp.tools import register_all
-from reolink_mcp.tools.observe import get_snapshot
+from reolink_mcp.tools.observe import get_capabilities, get_device_info, get_snapshot
 
 
 @dataclass
@@ -480,3 +480,254 @@ async def test_get_snapshot_sub_session_limit_raises_without_retrying_main(
 
     assert str(exc_info.value) == expected_message
     host.get_snapshot.assert_awaited_once_with(0, stream="sub")
+
+
+# ---------------------------------------------------------------------------
+# get_device_info (Plan 02-01) — pure read over the already-connected Host,
+# zero additional awaited calls beyond manager.get()'s own connect (Pattern
+# 1). full=True adds is_nvr/is_battery/num_channels (D-02).
+# ---------------------------------------------------------------------------
+
+
+def _configure_device_info_mock(host) -> None:
+    """Set every Host attribute get_device_info reads, mirroring a real
+    GetDevInfo response (RESEARCH.md Pattern 1's accessor table)."""
+    host.model = "RLC-810A"
+    host.sw_version = "v3.1.0.123"
+    host.hardware_version = "IPC_3816M"
+    host.mac_address = "AA:BB:CC:DD:EE:FF"
+    host.manufacturer = "Reolink"
+    host.is_nvr = False
+    host.is_battery = False
+    host.num_channels = 1
+    host.item_number = Mock(return_value="P437")
+    host.serial = Mock(return_value="00000000ABCDEF")
+
+
+async def test_get_device_info_returns_mapped_fields(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_device_info_mock(host)
+    cameras = {"front_door": camera_config_factory(host="192.168.1.10")}
+    manager = manager_factory(cameras, host)
+
+    info = await get_device_info("front_door", _fake_ctx(manager))
+
+    assert info["camera"] == "front_door"
+    assert info["model"] == "RLC-810A"
+    assert info["item_number"] == "P437"
+    assert info["firmware_version"] == "v3.1.0.123"
+    assert info["hardware_version"] == "IPC_3816M"
+    assert info["serial"] == "00000000ABCDEF"
+    assert info["mac_address"] == "AA:BB:CC:DD:EE:FF"
+    assert info["manufacturer"] == "Reolink"
+    assert info["configured_host"] == "192.168.1.10"
+    assert info["channel"] == 0
+
+
+async def test_get_device_info_makes_zero_additional_awaited_calls(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_device_info_mock(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await get_device_info("front_door", _fake_ctx(manager))
+
+    # Proves the "zero extra I/O" claim: get_host_data was awaited exactly
+    # once, by manager.get()'s own connect — get_device_info issues no
+    # additional awaited host calls (RESEARCH.md Pattern 1).
+    assert host.get_host_data.await_count == 1
+
+
+async def test_get_device_info_full_true_adds_hardware_flags(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_device_info_mock(host)
+    host.is_nvr = True
+    host.is_battery = True
+    host.num_channels = 8
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    info = await get_device_info("front_door", _fake_ctx(manager), full=True)
+
+    assert info["is_nvr"] is True
+    assert info["is_battery"] is True
+    assert info["num_channels"] == 8
+
+
+async def test_get_device_info_unknown_camera_raises_unknown_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(UnknownCameraError) as exc_info:
+        await get_device_info("garage", _fake_ctx(manager))
+
+    message = str(exc_info.value)
+    assert "garage" in message
+    assert "front_door" in message
+
+
+# ---------------------------------------------------------------------------
+# get_capabilities (Plan 02-01) — CAPABILITY_MAP-derived reads via
+# capabilities.gate(), plus dynamic ai_detection_types. full=True adds
+# raw_capabilities/siren_schedule (D-02, D-11).
+#
+# Mock host.supported is ALWAYS a per-capability-string dict lookup (never a
+# single blanket bool) — a blanket mock cannot catch the siren/siren_play or
+# ptz/ptz_presets string-mismatch bug class (RESEARCH.md Pitfalls 3/4).
+# ---------------------------------------------------------------------------
+
+
+def _per_string_supported(mapping: dict[str, bool]):
+    return lambda channel, cap: mapping.get(cap, False)
+
+
+async def test_get_capabilities_maps_curated_keys_and_ai_types(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    host.supported = _per_string_supported(
+        {
+            "zoom": True,
+            "ir_lights": True,
+            "floodLight": True,
+            "siren_play": True,
+            "ptz_presets": False,
+            "dayNight": True,
+            "motion_detection": True,
+        }
+    )
+    host.ai_supported_types = Mock(return_value=["people", "vehicle"])
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    caps = await get_capabilities("front_door", _fake_ctx(manager))
+
+    assert caps["camera"] == "front_door"
+    assert caps["zoom"] is True
+    assert caps["ir_lights"] is True
+    assert caps["white_led"] is True
+    assert caps["siren"] is True
+    assert caps["ptz_presets"] is False
+    assert caps["day_night"] is True
+    assert caps["motion_detection"] is True
+    assert caps["ai_detection_types"] == ["people", "vehicle"]
+
+
+async def test_get_capabilities_full_true_adds_raw_capabilities_and_siren_schedule(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    # "siren_schedule" (full=true only) uses the raw "siren" capability
+    # string — distinct from the curated "siren" key's "siren_play" check
+    # (RESEARCH.md's explicit recommendation for this exact ambiguity).
+    host.supported = _per_string_supported({"siren_play": True, "siren": False})
+    host.ai_supported_types = Mock(return_value=[])
+    host.capabilities = {0: {"zoom", "ir_lights", "floodLight"}}
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    caps = await get_capabilities("front_door", _fake_ctx(manager), full=True)
+
+    assert caps["raw_capabilities"] == ["floodLight", "ir_lights", "zoom"]
+    assert caps["siren_schedule"] is False
+
+
+async def test_get_capabilities_p320_like_all_hardware_absent(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """P320 tri-state contrast (RESEARCH.md HDWR-01 section): fixed-lens, no
+    siren/spotlight/PTZ, but IR/day-night/motion are still supported — the
+    strongest live-hardware signal for the tri-state "unsupported" path."""
+    host = mock_host_factory()
+    host.supported = _per_string_supported(
+        {
+            "floodLight": False,
+            "siren_play": False,
+            "zoom": False,
+            "ptz_presets": False,
+            "ir_lights": True,
+            "dayNight": True,
+            "motion_detection": True,
+        }
+    )
+    host.ai_supported_types = Mock(return_value=[])
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    caps = await get_capabilities("front_door", _fake_ctx(manager))
+
+    assert caps["white_led"] is False
+    assert caps["siren"] is False
+    assert caps["zoom"] is False
+    assert caps["ptz_presets"] is False
+    assert caps["ir_lights"] is True
+    assert caps["day_night"] is True
+    assert caps["motion_detection"] is True
+
+
+# ---------------------------------------------------------------------------
+# get_device_info / get_capabilities — registration (readOnlyHint=True) and
+# structured-output verification via the real MCP protocol path (proves
+# dict[str, Any] actually populates structuredContent, RESEARCH.md
+# Pattern 6 — a regression list_cameras's bare-dict annotation can't catch).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tool_name", ["get_device_info", "get_capabilities"])
+async def test_new_observe_tools_registered_with_read_only_hint(tool_name):
+    test_mcp = FastMCP("probe-annotations")
+    register_all(test_mcp)
+
+    tools = await test_mcp.list_tools()
+    tool = next(t for t in tools if t.name == tool_name)
+
+    assert tool.annotations is not None
+    assert tool.annotations.readOnlyHint is True
+
+
+async def test_get_device_info_populates_structured_content(
+    mock_host_factory, camera_config_factory, monkeypatch
+):
+    host = mock_host_factory()
+    _configure_device_info_mock(host)
+    cameras = {"front_door": camera_config_factory(host="192.168.1.10")}
+    manager = _manager_with_per_camera_hosts(
+        cameras, {"192.168.1.10": host}, monkeypatch
+    )
+    test_mcp = _build_test_mcp(manager)
+
+    async with create_connected_server_and_client_session(test_mcp) as session:
+        result = await session.call_tool("get_device_info", {"camera": "front_door"})
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert result.structuredContent["camera"] == "front_door"
+
+
+async def test_get_capabilities_populates_structured_content(
+    mock_host_factory, camera_config_factory, monkeypatch
+):
+    host = mock_host_factory()
+    host.supported = _per_string_supported({"zoom": True})
+    host.ai_supported_types = Mock(return_value=[])
+    cameras = {"front_door": camera_config_factory(host="192.168.1.10")}
+    manager = _manager_with_per_camera_hosts(
+        cameras, {"192.168.1.10": host}, monkeypatch
+    )
+    test_mcp = _build_test_mcp(manager)
+
+    async with create_connected_server_and_client_session(test_mcp) as session:
+        result = await session.call_tool("get_capabilities", {"camera": "front_door"})
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert result.structuredContent["camera"] == "front_door"
