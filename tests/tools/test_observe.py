@@ -625,7 +625,23 @@ async def test_get_capabilities_maps_curated_keys_and_ai_types(
     assert caps["ptz_presets"] is False
     assert caps["day_night"] is True
     assert caps["motion_detection"] is True
-    assert caps["ai_detection_types"] == ["people", "vehicle"]
+    assert caps["ai_detection_types"] == ["person", "vehicle"]
+
+
+async def test_get_capabilities_full_true_includes_raw_ai_types(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    host.supported = _per_string_supported({})
+    host.ai_supported_types = Mock(return_value=["people", "vehicle", "dog_cat"])
+    host.capabilities = {0: set()}
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    caps = await get_capabilities("front_door", _fake_ctx(manager), full=True)
+
+    assert caps["ai_detection_types"] == ["person", "vehicle", "pet"]
+    assert caps["raw_ai_types"] == ["people", "vehicle", "dog_cat"]
 
 
 async def test_get_capabilities_full_true_adds_raw_capabilities_and_siren_schedule(
@@ -790,6 +806,51 @@ async def test_get_states_full_true_passes_cmd_list_none_and_forces_poll(
     assert host.get_states.await_count == 2
     calls = host.get_states.await_args_list
     assert calls[1] == call(cmd_list=None)
+
+
+async def test_get_states_full_true_status_led_unsupported_when_capability_absent(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_states_mock(host)
+    host.supported = _per_string_supported(
+        {
+            "dayNight": True,
+            "floodLight": True,
+            "ir_lights": True,
+            "siren_play": True,
+            "status_led": False,
+        }
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await get_states("front_door", _fake_ctx(manager), full=True)
+
+    assert result["status_led"] == "unsupported"
+
+
+async def test_get_states_full_true_status_led_reports_state_when_supported(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_states_mock(host)
+    host.supported = _per_string_supported(
+        {
+            "dayNight": True,
+            "floodLight": True,
+            "ir_lights": True,
+            "siren_play": True,
+            "status_led": True,
+        }
+    )
+    host.status_led_enabled = Mock(return_value=True)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await get_states("front_door", _fake_ctx(manager), full=True)
+
+    assert result["status_led"] is True
 
 
 async def test_get_states_returns_curated_fields_when_supported(
