@@ -129,3 +129,14 @@ None beyond what Task 2 already exercised — the operator reused the existing P
 ---
 *Phase: 02-full-observe-surface*
 *Completed: 2026-07-09*
+
+## Self-Check: PASSED
+
+- FOUND: src/reolink_mcp/tools/observe.py (`_standalone_channel_fallback` x3)
+- FOUND: tests/tools/test_observe.py (`_per_channel_getter` + both regression tests)
+- FOUND: .planning/phases/02-full-observe-surface/02-HUMAN-UAT.md (0 pending, 7/7 pass, status complete)
+- FOUND commit: f795cf2 (Task 1 RED)
+- FOUND commit: 8e03d61 (Task 1 GREEN)
+- FOUND commit: d4c9692 (SUMMARY)
+- `uv run pytest tests/ -q` — 93 passed
+- `uv run ruff check src/ tests/` — all checks passed
