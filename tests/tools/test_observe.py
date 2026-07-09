@@ -596,7 +596,7 @@ async def test_get_device_info_unknown_camera_raises_unknown_camera_error(
     assert "front_door" in message
 
 
-async def test_get_device_info_serial_and_item_number_fall_back_when_standalone_channel_key_missing(
+async def test_get_device_info_serial_and_item_number_fall_back_when_standalone_channel_key_missing(  # noqa: E501
     mock_host_factory, camera_config_factory, manager_factory
 ):
     """02-VERIFICATION.md gap #1 repro: a real standalone camera's

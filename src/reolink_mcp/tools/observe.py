@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -199,6 +200,26 @@ async def get_snapshot(camera: str, ctx: Context) -> tuple[str, Image]:
     return (caption, Image(data=jpeg_bytes, format="jpeg"))
 
 
+def _standalone_channel_fallback(
+    getter: Callable[[int | None], str | None], channel: int | None, is_nvr: bool
+) -> str | None:
+    """Fall back to the `None`-keyed value when `getter(channel)` returns
+    `None` for a standalone (non-NVR) camera — mirrors the installed
+    `reolink_aio.api.Host.camera_model()`'s own `not self.is_nvr` None-key
+    fallback (0.21.3) exactly. `Host.serial()`/`Host.item_number()` lack
+    this fallback: for a standalone host, `get_host_data()`'s `GetDevInfo`
+    response only ever populates `self._serial[None]`/`self._item_number
+    [None]` — the numeric-channel key is never set, so `host.serial(0)`/
+    `host.item_number(0)` are unconditionally `None` without this helper
+    (02-VERIFICATION.md gap #1). Never applied when `is_nvr` is `True` —
+    an NVR channel that genuinely has no serial must not borrow its
+    parent's."""
+    value = getter(channel)
+    if value is None and channel is not None and not is_nvr:
+        return getter(None)
+    return value
+
+
 async def get_device_info(
     camera: str, ctx: Context, full: bool = False
 ) -> dict[str, Any]:
@@ -218,10 +239,10 @@ async def get_device_info(
     info: dict[str, Any] = {
         "camera": camera,
         "model": host.model,
-        "item_number": host.item_number(ch),
+        "item_number": _standalone_channel_fallback(host.item_number, ch, host.is_nvr),
         "firmware_version": host.sw_version,
         "hardware_version": host.hardware_version,
-        "serial": host.serial(ch),
+        "serial": _standalone_channel_fallback(host.serial, ch, host.is_nvr),
         "mac_address": host.mac_address,
         "manufacturer": host.manufacturer,
         "configured_host": manager.configured_host(camera),
