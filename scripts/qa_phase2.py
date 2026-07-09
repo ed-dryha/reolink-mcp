@@ -14,8 +14,11 @@ constants) with structural checks for the four new Phase 2 observe tools:
                        ptz_presets unsupported; P320 reports white_led/
                        siren/zoom unsupported while P437 reports them
                        supported)
-  3. states          — get_states: tri-state fields are bool/dict/
-                       "unsupported", motion is bool, polled_at/age_seconds
+  3. states          — get_states: day_night is a non-empty state-name
+                       string or "unsupported"; white_led is a dict or
+                       "unsupported"; ir_lights is a bool or "unsupported";
+                       siren is the literal string "supported" or
+                       "unsupported"; motion is bool; polled_at/age_seconds
                        are sane
   4. recent events   — get_recent_events: person/vehicle/pet are each one of
                        detected/not_detected/unsupported, motion is bool,
@@ -67,7 +70,13 @@ CAPABILITY_BOOL_FIELDS = [
     "day_night",
     "motion_detection",
 ]
-STATE_TRISTATE_FIELDS = ["day_night", "white_led", "ir_lights", "siren"]
+STATE_FIELD_VALIDATORS = {
+    # daynight_state() returns a str ("Auto"/"Color"/"Black&White"), or "unsupported"
+    "day_night": lambda v: isinstance(v, str) and v != "",
+    "white_led": lambda v: isinstance(v, dict) or v == "unsupported",
+    "ir_lights": lambda v: isinstance(v, bool) or v == "unsupported",
+    "siren": lambda v: v in ("supported", "unsupported"),
+}
 BASELINE_EVENT_TYPES = ["person", "vehicle", "pet"]
 ALLOWED_EVENT_VALUES = {"detected", "not_detected", "unsupported"}
 
@@ -259,10 +268,10 @@ async def check_states(env: dict[str, str], names: list[str]) -> bool:
             continue
         data = parse_tool_result(result, "get_states")
         problems = []
-        for f in STATE_TRISTATE_FIELDS:
+        for f, valid in STATE_FIELD_VALIDATORS.items():
             v = data.get(f)
-            if not (isinstance(v, bool) or isinstance(v, dict) or v == "unsupported"):
-                problems.append(f"{f}={v!r} is not bool/dict/'unsupported'")
+            if not valid(v):
+                problems.append(f"{f}={v!r} fails contract check")
         if not isinstance(data.get("motion"), bool):
             problems.append(f"motion={data.get('motion')!r} is not a bool")
         polled_at = data.get("polled_at")
@@ -277,7 +286,7 @@ async def check_states(env: dict[str, str], names: list[str]) -> bool:
         ok &= good
         summary = ", ".join(
             f"{f}={data.get(f)!r}"
-            for f in [*STATE_TRISTATE_FIELDS, "motion", "polled_at", "age_seconds"]
+            for f in [*STATE_FIELD_VALIDATORS, "motion", "polled_at", "age_seconds"]
         )
         print(f"  [{PASS if good else FAIL}] {name}: {summary}")
         if problems:
