@@ -12,20 +12,27 @@ this purpose.
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from unittest.mock import AsyncMock
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, call
 
+import pytest
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
+from PIL import Image as PILImage
 from reolink_aio.exceptions import ReolinkConnectionError
 
-from reolink_mcp.errors import classify_reolink_error
+from reolink_mcp.errors import CameraError, UnknownCameraError, classify_reolink_error
 from reolink_mcp.manager import CameraManager
 from reolink_mcp.tools import register_all
+from reolink_mcp.tools.observe import get_snapshot
 
 
 @dataclass
@@ -182,3 +189,197 @@ async def test_list_cameras_registered_with_read_only_hint():
 
     assert tool.annotations is not None
     assert tool.annotations.readOnlyHint is True
+
+
+# ---------------------------------------------------------------------------
+# get_snapshot (Plan 01-04) — sub-then-main fallback, unconditional
+# downscale, image + caption return, curated error translation.
+#
+# Most cases call `get_snapshot` directly (not through the protocol layer)
+# with a minimal `SimpleNamespace`-based fake `Context` — this surfaces
+# raised exceptions with their real type (CameraError/UnknownCameraError)
+# for precise assertions, matching the plan's <behavior> wording ("the tool
+# raises..."). One case (the downscale test) drives the call through the
+# real MCP protocol path instead, proving the `Image` helper's
+# base64/ImageContent conversion actually works end-to-end — this is also
+# where the `structured_output=False` registration fix (see Deviations)
+# gets exercised for real.
+# ---------------------------------------------------------------------------
+
+
+def _fake_ctx(manager: CameraManager) -> SimpleNamespace:
+    """Minimal stand-in for a FastMCP `Context`, exposing only the nested
+    attribute path `get_snapshot` actually reads:
+    `ctx.request_context.lifespan_context.manager`."""
+    return SimpleNamespace(
+        request_context=SimpleNamespace(
+            lifespan_context=SimpleNamespace(manager=manager)
+        )
+    )
+
+
+def _make_jpeg_bytes(width: int, height: int) -> bytes:
+    """Build a synthetic solid-color JPEG in memory — no binary fixture
+    files committed to the repo (per the plan's explicit instruction)."""
+    buf = io.BytesIO()
+    PILImage.new("RGB", (width, height), color=(128, 128, 128)).save(
+        buf, format="JPEG"
+    )
+    return buf.getvalue()
+
+
+async def test_get_snapshot_sub_stream_success_calls_only_sub(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    jpeg_bytes = _make_jpeg_bytes(640, 480)
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(return_value=jpeg_bytes)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    caption, image = await get_snapshot("front_door", _fake_ctx(manager))
+
+    host.get_snapshot.assert_awaited_once_with(0, stream="sub")
+    assert "front_door" in caption
+    assert isinstance(image.data, bytes)
+
+
+async def test_get_snapshot_falls_back_to_main_when_sub_returns_none(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    jpeg_bytes = _make_jpeg_bytes(640, 480)
+
+    async def snapshot_side_effect(channel, stream=None):
+        if stream == "sub":
+            return None
+        return jpeg_bytes
+
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(side_effect=snapshot_side_effect)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    caption, image = await get_snapshot("front_door", _fake_ctx(manager))
+
+    assert host.get_snapshot.await_count == 2
+    calls = host.get_snapshot.await_args_list
+    assert calls[0] == call(0, stream="sub")
+    assert calls[1] == call(0, stream="main")
+    assert isinstance(image.data, bytes)
+    assert "front_door" in caption
+
+
+async def test_get_snapshot_both_streams_none_raises_privacy_mode_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(return_value=None)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await get_snapshot("front_door", _fake_ctx(manager))
+
+    message = str(exc_info.value)
+    assert "privacy mode" in message or "no image" in message
+    assert host.get_snapshot.await_count == 2
+
+
+async def test_get_snapshot_downscales_oversized_image_via_real_protocol(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """Drives the call through the real MCP protocol path (like 01-03's
+    list_cameras tests) — proves the `Image` helper's base64/ImageContent
+    conversion actually works end-to-end, not just that raw bytes are
+    correctly sized."""
+    jpeg_bytes = _make_jpeg_bytes(4000, 3000)
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(return_value=jpeg_bytes)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+    test_mcp = _build_test_mcp(manager)
+
+    async with create_connected_server_and_client_session(test_mcp) as session:
+        result = await session.call_tool("get_snapshot", {"camera": "front_door"})
+
+    assert result.isError is False
+    assert len(result.content) == 2
+    text_block, image_block = result.content
+    assert text_block.type == "text"
+    assert "1280x960" in text_block.text
+    assert image_block.type == "image"
+    assert image_block.mimeType == "image/jpeg"
+    decoded = base64.b64decode(image_block.data)
+    with PILImage.open(io.BytesIO(decoded)) as decoded_image:
+        assert decoded_image.size[0] <= 1280
+        assert decoded_image.size[1] <= 1280
+        assert decoded_image.size == (1280, 960)
+
+
+async def test_get_snapshot_does_not_upscale_small_image(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    jpeg_bytes = _make_jpeg_bytes(640, 480)
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(return_value=jpeg_bytes)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    caption, image = await get_snapshot("front_door", _fake_ctx(manager))
+
+    with PILImage.open(io.BytesIO(image.data)) as decoded_image:
+        assert decoded_image.size == (640, 480)
+    assert "640x480" in caption
+
+
+async def test_get_snapshot_caption_contains_camera_name_and_iso_timestamp(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    jpeg_bytes = _make_jpeg_bytes(640, 480)
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(return_value=jpeg_bytes)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    caption, _image = await get_snapshot("front_door", _fake_ctx(manager))
+
+    parts = caption.split(" — ")
+    assert parts[0] == "front_door"
+    assert parts[1].startswith("captured ")
+    timestamp_str = parts[1].removeprefix("captured ")
+    datetime.fromisoformat(timestamp_str)
+
+
+async def test_get_snapshot_unknown_camera_raises_unknown_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(UnknownCameraError) as exc_info:
+        await get_snapshot("garage", _fake_ctx(manager))
+
+    message = str(exc_info.value)
+    assert "garage" in message
+    assert "front_door" in message
+
+
+async def test_get_snapshot_non_reolink_exception_translated_to_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    raw_exc = ConnectionResetError(
+        "raw socket reset mid-session — must never reach the tool response"
+    )
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(side_effect=raw_exc)
+    cameras = {"front_door": camera_config_factory(host="192.168.1.10")}
+    manager = manager_factory(cameras, host)
+    expected_message = classify_reolink_error(raw_exc, "front_door", "192.168.1.10")
+
+    with pytest.raises(CameraError) as exc_info:
+        await get_snapshot("front_door", _fake_ctx(manager))
+
+    assert str(exc_info.value) == expected_message
+    assert "raw socket reset" not in str(exc_info.value)
+    host.get_snapshot.assert_awaited_once_with(0, stream="sub")
