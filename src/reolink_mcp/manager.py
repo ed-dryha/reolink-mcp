@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 from reolink_aio.api import Host
 
@@ -50,6 +51,7 @@ class CameraHandle:
     host: Host
     channel: int
     connected: bool = True
+    states_polled_at: datetime | None = None
 
 
 class CameraManager:

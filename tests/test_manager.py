@@ -54,6 +54,9 @@ async def test_get_caches_handle_after_first_connect(
     assert handle1.name == "front_door"
     assert handle1.channel == 0
     assert handle1.connected is True
+    # Phase 2 Plan 2 (Pitfall 1 guard): connect must NOT set states_polled_at
+    # — only get_states/get_recent_events do, on their own first call.
+    assert handle1.states_polled_at is None
 
 
 async def test_get_raises_camera_error_matching_classifier(
