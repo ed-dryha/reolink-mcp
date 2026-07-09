@@ -17,9 +17,24 @@ from datetime import UTC, datetime
 
 from mcp.server.fastmcp import Context, Image
 from PIL import Image as PILImage
-from reolink_aio.exceptions import ReolinkError
+from reolink_aio.exceptions import CredentialsInvalidError, LoginError, ReolinkError
 
 from reolink_mcp.errors import CameraError, classify_reolink_error
+
+
+def _is_auth_or_session_failure(exc: ReolinkError) -> bool:
+    """True for exceptions that mean "don't bother retrying the next stream"
+    — a fresh login attempt against `main` after one of these would either
+    fail identically (bad credentials) or accelerate the account-lockout/
+    session-limit condition itself (CR-02 / G2, threat T-05-02). Mirrors
+    `errors.py::classify_reolink_error`'s own session-limit substring test
+    exactly (same two substrings, same LoginError type check) so the two
+    never diverge."""
+    if isinstance(exc, CredentialsInvalidError):
+        return True
+    return isinstance(exc, LoginError) and (
+        "max session" in str(exc) or "-5" in str(exc)
+    )
 
 
 async def list_cameras(ctx: Context) -> dict:
@@ -98,28 +113,48 @@ async def get_snapshot(camera: str, ctx: Context) -> tuple[str, Image]:
 
     # Sub-stream first, main-stream fallback (D-02) — get_snapshot()'s own
     # default is "main", NOT "sub", so stream must always be passed
-    # explicitly (01-RESEARCH.md Pattern 3). The inner `except ReolinkError`
-    # only catches reolink-aio's own error hierarchy so a failed sub attempt
-    # can still fall back to main; the outer `except Exception` is the
-    # catch-all guaranteeing a non-ReolinkError transport failure (e.g. a
-    # raw aiohttp connection drop mid-session) is translated into a curated
-    # CameraError instead of propagating as an unhandled traceback (T-04-01).
+    # explicitly (01-RESEARCH.md Pattern 3). `except ReolinkError` catches
+    # reolink-aio's own error hierarchy so a failed sub attempt can still
+    # fall back to main; `except Exception` is the catch-all guaranteeing a
+    # non-ReolinkError transport failure (e.g. a raw aiohttp connection drop
+    # mid-session) is translated into a curated CameraError instead of
+    # propagating as an unhandled traceback (T-04-01). Every ReolinkError
+    # raised by either attempt is retained in `last_exc` and classified via
+    # classify_reolink_error's curated taxonomy when both attempts produce
+    # no data (CR-02 / G2) — it is never silently discarded. An auth/
+    # session-class failure (CredentialsInvalidError, or a session-limit
+    # LoginError) on the sub attempt raises immediately without trying
+    # main, avoiding a second failed login (threat T-05-02).
+    last_exc: Exception | None = None
     try:
-        try:
-            data = await handle.host.get_snapshot(handle.channel, stream="sub")
-        except ReolinkError:
-            data = None
-        if not data:
-            try:
-                data = await handle.host.get_snapshot(handle.channel, stream="main")
-            except ReolinkError:
-                data = None
+        data = await handle.host.get_snapshot(handle.channel, stream="sub")
+    except ReolinkError as exc:
+        if _is_auth_or_session_failure(exc):
+            raise CameraError(
+                classify_reolink_error(exc, camera, manager.configured_host(camera))
+            ) from exc
+        last_exc, data = exc, None
     except Exception as exc:
         raise CameraError(
             classify_reolink_error(exc, camera, manager.configured_host(camera))
         ) from exc
 
     if not data:
+        try:
+            data = await handle.host.get_snapshot(handle.channel, stream="main")
+        except ReolinkError as exc:
+            last_exc, data = exc, None
+        except Exception as exc:
+            raise CameraError(
+                classify_reolink_error(exc, camera, manager.configured_host(camera))
+            ) from exc
+
+    if not data:
+        if last_exc is not None:
+            host = manager.configured_host(camera)
+            raise CameraError(
+                classify_reolink_error(last_exc, camera, host)
+            ) from last_exc
         raise CameraError(
             f"camera '{camera}' returned no image — privacy mode may be "
             "enabled, or the camera is mid-reboot"
