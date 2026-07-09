@@ -27,7 +27,11 @@ import pytest
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
 from PIL import Image as PILImage
-from reolink_aio.exceptions import ReolinkConnectionError
+from reolink_aio.exceptions import (
+    CredentialsInvalidError,
+    LoginError,
+    ReolinkConnectionError,
+)
 
 from reolink_mcp.errors import CameraError, UnknownCameraError, classify_reolink_error
 from reolink_mcp.manager import CameraManager
@@ -382,4 +386,97 @@ async def test_get_snapshot_non_reolink_exception_translated_to_camera_error(
 
     assert str(exc_info.value) == expected_message
     assert "raw socket reset" not in str(exc_info.value)
+    host.get_snapshot.assert_awaited_once_with(0, stream="sub")
+
+
+# ---------------------------------------------------------------------------
+# get_snapshot (Plan 01-05, CR-02 / G2) — the sub/main stream attempts must
+# classify their own ReolinkError failures through classify_reolink_error's
+# curated taxonomy instead of collapsing into the generic "privacy mode"
+# fallback, and must never retry main after an auth/session-class failure
+# on sub.
+# ---------------------------------------------------------------------------
+
+
+async def test_get_snapshot_sub_raises_reolink_error_falls_back_to_main(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    jpeg_bytes = _make_jpeg_bytes(640, 480)
+
+    async def snapshot_side_effect(channel, stream=None):
+        if stream == "sub":
+            raise ReolinkConnectionError("sub refused")
+        return jpeg_bytes
+
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(side_effect=snapshot_side_effect)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    caption, image = await get_snapshot("front_door", _fake_ctx(manager))
+
+    assert host.get_snapshot.await_count == 2
+    calls = host.get_snapshot.await_args_list
+    assert calls[0] == call(0, stream="sub")
+    assert calls[1] == call(0, stream="main")
+    assert isinstance(image.data, bytes)
+    assert "front_door" in caption
+
+
+async def test_get_snapshot_both_streams_raise_reolink_error_classifies_last_exc(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    main_exc = ReolinkConnectionError("refused")
+
+    async def snapshot_side_effect(channel, stream=None):
+        if stream == "sub":
+            raise ReolinkConnectionError("refused")
+        raise main_exc
+
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(side_effect=snapshot_side_effect)
+    cameras = {"front_door": camera_config_factory(host="192.168.1.10")}
+    manager = manager_factory(cameras, host)
+    expected_message = classify_reolink_error(main_exc, "front_door", "192.168.1.10")
+
+    with pytest.raises(CameraError) as exc_info:
+        await get_snapshot("front_door", _fake_ctx(manager))
+
+    assert str(exc_info.value) == expected_message
+    assert "privacy mode" not in str(exc_info.value)
+    assert "mid-reboot" not in str(exc_info.value)
+    assert host.get_snapshot.await_count == 2
+
+
+async def test_get_snapshot_sub_credentials_invalid_raises_without_retrying_main(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    exc = CredentialsInvalidError("invalid user")
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(side_effect=exc)
+    cameras = {"front_door": camera_config_factory(host="192.168.1.10")}
+    manager = manager_factory(cameras, host)
+    expected_message = classify_reolink_error(exc, "front_door", "192.168.1.10")
+
+    with pytest.raises(CameraError) as exc_info:
+        await get_snapshot("front_door", _fake_ctx(manager))
+
+    assert str(exc_info.value) == expected_message
+    host.get_snapshot.assert_awaited_once_with(0, stream="sub")
+
+
+async def test_get_snapshot_sub_session_limit_raises_without_retrying_main(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    exc = LoginError("login failed: {'rspCode': -5, 'detail': 'max session'}")
+    host = mock_host_factory()
+    host.get_snapshot = AsyncMock(side_effect=exc)
+    cameras = {"front_door": camera_config_factory(host="192.168.1.10")}
+    manager = manager_factory(cameras, host)
+    expected_message = classify_reolink_error(exc, "front_door", "192.168.1.10")
+
+    with pytest.raises(CameraError) as exc_info:
+        await get_snapshot("front_door", _fake_ctx(manager))
+
+    assert str(exc_info.value) == expected_message
     host.get_snapshot.assert_awaited_once_with(0, stream="sub")
