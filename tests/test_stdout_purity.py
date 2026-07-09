@@ -63,6 +63,10 @@ async def test_server_completes_initialize_handshake_over_real_stdio(
         command=sys.executable,
         args=["-m", "reolink_mcp"],
         env=_subprocess_env(fixture_config),
+        # cwd must NOT be the repo root: pydantic-settings' dev-loop
+        # env_file=".env" would merge a developer's local .env (phantom
+        # cameras with password but no host/username) into the fixture config.
+        cwd=str(fixture_config.parent),
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
@@ -81,6 +85,8 @@ def test_subprocess_raw_stdout_is_json_rpc_only(fixture_config: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=_subprocess_env(fixture_config),
+        # Same isolation as above: never let the repo root's .env leak in.
+        cwd=fixture_config.parent,
         text=True,
         bufsize=1,
     )

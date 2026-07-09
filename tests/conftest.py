@@ -29,6 +29,11 @@ def tmp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     config_path = tmp_path / "config.yaml"
     monkeypatch.setenv("RMCP_CONFIG_FILE", str(config_path))
     monkeypatch.setattr("reolink_mcp.config.CONFIG_PATH", config_path)
+    # Isolate from the developer's repo-root .env: Settings has the dev-loop
+    # convenience env_file=".env" (resolved against cwd), which would merge
+    # local camera passwords into the test's YAML as phantom half-configured
+    # cameras (password present, host/username missing).
+    monkeypatch.chdir(tmp_path)
     return config_path
 
 
