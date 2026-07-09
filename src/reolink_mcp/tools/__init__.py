@@ -13,9 +13,20 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from reolink_mcp.tools.observe import list_cameras
+from reolink_mcp.tools.observe import get_snapshot, list_cameras
 
 
 def register_all(mcp: FastMCP) -> None:
     """Register every tool on `mcp`. Call once, after `mcp = FastMCP(...)`."""
     mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))(list_cameras)
+    # structured_output=False: get_snapshot returns tuple[str, Image]. The
+    # installed mcp==1.28.1 SDK's default structured-output path tries to
+    # build a pydantic schema for the return annotation, and mcp's own
+    # Image helper is not a pydantic-schemable type (verified empirically —
+    # registering without this flag raises PydanticSchemaGenerationError at
+    # import time). structured_output=False keeps the tuple's unstructured
+    # content-block conversion (str -> TextContent, Image -> ImageContent)
+    # that D-01 depends on, without attempting schema generation.
+    mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=True), structured_output=False
+    )(get_snapshot)
