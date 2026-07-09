@@ -19,10 +19,21 @@ from typing import Any
 
 from mcp.server.fastmcp import Context, Image
 from PIL import Image as PILImage
+from reolink_aio.api import (
+    PERSON_DETECTION_TYPE,
+    PET_DETECTION_TYPE,
+    VEHICLE_DETECTION_TYPE,
+)
 from reolink_aio.exceptions import CredentialsInvalidError, LoginError, ReolinkError
 
 from reolink_mcp.capabilities import CAPABILITY_MAP, gate
 from reolink_mcp.errors import CameraError, classify_reolink_error
+
+# Baseline: always checked and tri-stated, even if this camera lacks them —
+# this is what makes "unsupported" observable (D-06/D-09). The set is
+# deliberately not the ceiling of what get_recent_events can report — see
+# the dynamic-extension loop in get_recent_events itself (D-07).
+BASELINE_AI_TYPES = [PERSON_DETECTION_TYPE, VEHICLE_DETECTION_TYPE, PET_DETECTION_TYPE]
 
 
 def _is_auth_or_session_failure(exc: ReolinkError) -> bool:
@@ -336,4 +347,82 @@ async def get_states(
             if host.supported(ch, "siren")
             else "unsupported"
         )
+    return result
+
+
+async def get_recent_events(
+    camera: str, ctx: Context, refresh: bool = False, full: bool = False
+) -> dict[str, Any]:
+    """Current AI detection state for `camera` from an on-demand poll — this
+    is current state, not event history; it reports whatever the camera's
+    live detection flags say right now, at the moment of the poll (D-04).
+    Flags may be stale unless `refresh=True` is passed — see
+    `polled_at`/`age_seconds`.
+
+    Reports tri-state `"detected"`/`"not_detected"`/`"unsupported"` for the
+    baseline person/vehicle/pet trio (D-06), plus any additional AI type
+    the camera's firmware dynamically reports (e.g. face/package on richer
+    models) with zero code changes needed (D-07). Also includes the plain,
+    non-AI `motion` flag, independent of any AI type's support/detection
+    state (D-08).
+
+    Shares `get_states`' EXACT same refresh/first-poll gating — both tools
+    observe one `CameraHandle.states_polled_at` clock, not two independent
+    ones (D-04). `host.get_states()` already fetches motion + AI detection
+    unconditionally regardless of `cmd_list` content, so no separate AI-
+    state call is needed here.
+
+    The raw wire keys `reolink-aio` returns from `ai_supported_types()` do
+    NOT match the friendly constants (`"people"`/`"dog_cat"` vs `"person"`/
+    `"pet"`, Pitfall 2) — the baseline trio goes through `ai_supported()`/
+    `ai_detected()` (which apply the conversion internally), and the
+    dynamic-extras loop below applies the reverse map explicitly so the
+    output vocabulary stays friendly-name-only throughout."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    host, ch = handle.host, handle.channel
+
+    # SAME refresh call/gate as get_states (D-04) — not a second, divergent
+    # refresh mechanism.
+    if refresh or full or handle.states_polled_at is None:
+        cmd_list = None if full else states_cmd_list(ch)
+        try:
+            await host.get_states(cmd_list=cmd_list)
+        except Exception as exc:
+            raise CameraError(
+                classify_reolink_error(exc, camera, manager.configured_host(camera))
+            ) from exc
+        handle.states_polled_at = datetime.now(UTC)
+
+    report: dict[str, str] = {}
+    seen: set[str] = set()
+    for detect_type in BASELINE_AI_TYPES:
+        seen.add(detect_type)
+        if host.ai_supported(ch, detect_type):
+            report[detect_type] = (
+                "detected" if host.ai_detected(ch, detect_type) else "not_detected"
+            )
+        else:
+            report[detect_type] = "unsupported"
+    for raw_type in host.ai_supported_types(ch):
+        friendly = {"people": PERSON_DETECTION_TYPE, "dog_cat": PET_DETECTION_TYPE}.get(
+            raw_type, raw_type
+        )
+        if friendly in seen:
+            continue
+        seen.add(friendly)
+        report[friendly] = (
+            "detected" if host.ai_detected(ch, raw_type) else "not_detected"
+        )
+
+    age = (datetime.now(UTC) - handle.states_polled_at).total_seconds()
+    result: dict[str, Any] = {
+        "camera": camera,
+        **report,
+        "motion": host.motion_detected(ch),
+        "polled_at": handle.states_polled_at.isoformat(),
+        "age_seconds": round(age, 1),
+    }
+    if full:
+        result["raw_ai_types"] = host.ai_supported_types(ch)
     return result

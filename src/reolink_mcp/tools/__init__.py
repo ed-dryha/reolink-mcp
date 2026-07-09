@@ -16,6 +16,7 @@ from mcp.types import ToolAnnotations
 from reolink_mcp.tools.observe import (
     get_capabilities,
     get_device_info,
+    get_recent_events,
     get_snapshot,
     get_states,
     list_cameras,
@@ -28,6 +29,7 @@ def register_all(mcp: FastMCP) -> None:
     mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))(get_device_info)
     mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))(get_capabilities)
     mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))(get_states)
+    mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))(get_recent_events)
     # get_snapshot returns tuple[str, Image]. The installed mcp==1.28.1
     # SDK's default structured-output path tries to build a pydantic schema
     # for the return annotation, and mcp's own Image helper is not a
