@@ -162,11 +162,12 @@ def load_settings() -> Settings:
 
     Every failure mode raises a named `SystemExit` — never a raw traceback
     or generic error (CONN-01, CONN-02). The `ValidationError` fallback
-    below never interpolates the raw error object or its `input_value`
-    (CR-01 / G1): a phantom-camera env var (a password set for a camera
-    name absent from YAML — a typo, a rename, or a WR-06 double-underscore
-    split) would otherwise leak its plaintext value via pydantic's
-    `input_value=...` repr in `str(ValidationError)`.
+    below never interpolates the raw error object itself, nor any of its
+    per-error field-value details (CR-01 / G1): a phantom-camera env var
+    (a password set for a camera name absent from YAML — a typo, a
+    rename, or a WR-06 double-underscore split) would otherwise leak its
+    plaintext value via pydantic's own field-value repr embedded in
+    `str(ValidationError)`.
     """
     if not CONFIG_PATH.exists():
         raise SystemExit(
@@ -206,7 +207,7 @@ def load_settings() -> Settings:
             ) from e
 
         # Redacted fallback — built only from e.errors()' loc/type, never
-        # the raw ValidationError object or its input_value.
+        # the raw ValidationError object or any per-error field value.
         details = "; ".join(
             f"{'.'.join(str(p) for p in error['loc'])}: {error['type']}"
             for error in e.errors()
