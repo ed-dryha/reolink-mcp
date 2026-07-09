@@ -39,6 +39,7 @@ from reolink_mcp.tools import register_all
 from reolink_mcp.tools.observe import (
     get_capabilities,
     get_device_info,
+    get_recent_events,
     get_snapshot,
     get_states,
 )
@@ -857,16 +858,162 @@ async def test_get_states_poll_failure_raises_curated_camera_error(
 
 
 # ---------------------------------------------------------------------------
-# get_device_info / get_capabilities / get_states — registration
-# (readOnlyHint=True) and structured-output verification via the real MCP
-# protocol path (proves dict[str, Any] actually populates structuredContent,
-# RESEARCH.md Pattern 6 — a regression list_cameras's bare-dict annotation
-# can't catch).
+# get_recent_events (Plan 02-02, Task 2) — tri-state AI detection (baseline
+# trio + dynamic extras), raw-wire-key-vs-friendly-constant mapping
+# (Pitfall 2), plain motion flag, and the exact same refresh/first-poll
+# clock as get_states (D-04 — one CameraHandle.states_polled_at, not two).
+# ---------------------------------------------------------------------------
+
+
+def _per_type_ai(mapping: dict[str, bool]):
+    """Per-detect-type lookup for host.ai_supported/host.ai_detected — never
+    a single blanket bool (mirrors get_capabilities' host.supported
+    discipline; catches the exact "person" vs "people" mismatch class,
+    Pitfall 2)."""
+    return lambda channel, detect_type: mapping.get(detect_type, False)
+
+
+def _configure_recent_events_mock(host) -> None:
+    """Baseline defaults: everything unsupported/no extras/no motion —
+    individual tests override the specific attrs they exercise."""
+    host.get_states = AsyncMock(return_value=None)
+    host.ai_supported = _per_type_ai({})
+    host.ai_detected = _per_type_ai({})
+    host.ai_supported_types = Mock(return_value=[])
+    host.motion_detected = Mock(return_value=False)
+
+
+async def test_get_recent_events_baseline_trio_tri_state(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_recent_events_mock(host)
+    host.ai_supported = _per_type_ai({"person": True, "vehicle": True, "pet": False})
+    host.ai_detected = _per_type_ai({"person": True, "vehicle": False})
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await get_recent_events("front_door", _fake_ctx(manager))
+
+    assert result["person"] == "detected"
+    assert result["vehicle"] == "not_detected"
+    assert result["pet"] == "unsupported"
+
+
+async def test_get_recent_events_maps_raw_wire_keys_to_friendly_names(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """Pitfall 2 regression guard: the raw-list fixture uses the camera's
+    actual wire keys ("people"/"dog_cat"), NOT the friendly constants — a
+    friendly-form fixture would not catch a "person" vs "people" bug."""
+    host = mock_host_factory()
+    _configure_recent_events_mock(host)
+    host.ai_supported = _per_type_ai({"person": True, "vehicle": True, "pet": True})
+    host.ai_detected = _per_type_ai({"person": True, "vehicle": False, "pet": False})
+    host.ai_supported_types = Mock(return_value=["people", "vehicle", "dog_cat"])
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await get_recent_events("front_door", _fake_ctx(manager))
+
+    assert "person" in result
+    assert "vehicle" in result
+    assert "pet" in result
+    assert "people" not in result
+    assert "dog_cat" not in result
+
+
+async def test_get_recent_events_dynamic_extra_type_appears_with_zero_code_changes(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_recent_events_mock(host)
+    host.ai_supported = _per_type_ai({"person": True, "vehicle": True, "pet": True})
+    host.ai_detected = _per_type_ai(
+        {"person": False, "vehicle": False, "pet": False, "face": True}
+    )
+    host.ai_supported_types = Mock(
+        return_value=["people", "vehicle", "dog_cat", "face"]
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await get_recent_events("front_door", _fake_ctx(manager))
+
+    assert result["face"] == "detected"
+
+
+async def test_get_recent_events_includes_motion_flag_independent_of_ai_state(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_recent_events_mock(host)
+    host.motion_detected = Mock(return_value=True)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await get_recent_events("front_door", _fake_ctx(manager))
+
+    assert result["motion"] is True
+    assert result["person"] == "unsupported"
+
+
+async def test_get_recent_events_and_get_states_share_one_poll_clock(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_recent_events_mock(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await get_recent_events("front_door", _fake_ctx(manager))
+    await get_states("front_door", _fake_ctx(manager))
+
+    host.get_states.assert_awaited_once()
+
+
+async def test_get_recent_events_includes_polled_at_and_age_seconds(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_recent_events_mock(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await get_recent_events("front_door", _fake_ctx(manager))
+
+    datetime.fromisoformat(result["polled_at"])
+    assert result["age_seconds"] >= 0
+
+
+async def test_get_recent_events_full_true_includes_raw_ai_types(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_recent_events_mock(host)
+    host.ai_supported_types = Mock(
+        return_value=["people", "vehicle", "dog_cat", "face"]
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await get_recent_events("front_door", _fake_ctx(manager), full=True)
+
+    assert result["raw_ai_types"] == ["people", "vehicle", "dog_cat", "face"]
+
+
+# ---------------------------------------------------------------------------
+# get_device_info / get_capabilities / get_states / get_recent_events —
+# registration (readOnlyHint=True) and structured-output verification via
+# the real MCP protocol path (proves dict[str, Any] actually populates
+# structuredContent, RESEARCH.md Pattern 6 — a regression list_cameras's
+# bare-dict annotation can't catch).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "tool_name", ["get_device_info", "get_capabilities", "get_states"]
+    "tool_name",
+    ["get_device_info", "get_capabilities", "get_states", "get_recent_events"],
 )
 async def test_new_observe_tools_registered_with_read_only_hint(tool_name):
     test_mcp = FastMCP("probe-annotations")
@@ -931,6 +1078,27 @@ async def test_get_states_populates_structured_content(
 
     async with create_connected_server_and_client_session(test_mcp) as session:
         result = await session.call_tool("get_states", {"camera": "front_door"})
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert result.structuredContent["camera"] == "front_door"
+
+
+async def test_get_recent_events_populates_structured_content(
+    mock_host_factory, camera_config_factory, monkeypatch
+):
+    host = mock_host_factory()
+    _configure_recent_events_mock(host)
+    cameras = {"front_door": camera_config_factory(host="192.168.1.10")}
+    manager = _manager_with_per_camera_hosts(
+        cameras, {"192.168.1.10": host}, monkeypatch
+    )
+    test_mcp = _build_test_mcp(manager)
+
+    async with create_connected_server_and_client_session(test_mcp) as session:
+        result = await session.call_tool(
+            "get_recent_events", {"camera": "front_door"}
+        )
 
     assert result.isError is False
     assert result.structuredContent is not None
