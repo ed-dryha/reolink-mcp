@@ -161,14 +161,21 @@ def load_settings() -> Settings:
     the full pydantic-settings env+YAML merge.
 
     Every failure mode raises a named `SystemExit` — never a raw traceback
-    or generic error (CONN-01, CONN-02).
+    or generic error (CONN-01, CONN-02). The `ValidationError` fallback
+    below never interpolates the raw error object itself, nor any of its
+    per-error field-value details (CR-01 / G1): a phantom-camera env var
+    (a password set for a camera name absent from YAML — a typo, a
+    rename, or a WR-06 double-underscore split) would otherwise leak its
+    plaintext value via pydantic's own field-value repr embedded in
+    `str(ValidationError)`.
     """
     if not CONFIG_PATH.exists():
         raise SystemExit(
             f"config error: no config file found at {CONFIG_PATH} — create "
             f"it or set RMCP_CONFIG_FILE to point at your camera config YAML"
         )
-    validate_yaml_shape(load_raw_cameras(CONFIG_PATH))
+    raw_cameras = load_raw_cameras(CONFIG_PATH)
+    validate_yaml_shape(raw_cameras)
     try:
         return Settings()
     except ValidationError as e:
@@ -180,4 +187,29 @@ def load_settings() -> Settings:
                     f"config error: camera '{name}' has no password — set "
                     f"RMCP_CAMERAS__{name}__PASSWORD"
                 ) from e
-        raise SystemExit(f"config error: {e}") from e
+
+        # Phantom-camera detection (CR-01 / G1): an env var password whose
+        # camera name has no matching YAML entry produces host/username
+        # "missing" errors under cameras.<name>.* — never a "password"
+        # error, since the env var itself provided that field. Only
+        # reached when the real-camera-missing-password branch above did
+        # not already match.
+        phantom_names = {
+            error["loc"][1]
+            for error in e.errors()
+            if len(error["loc"]) >= 2 and error["loc"][0] == "cameras"
+        } - set(raw_cameras)
+        if phantom_names:
+            name = sorted(phantom_names)[0]
+            raise SystemExit(
+                f"config error: no camera named '{name}' in YAML — "
+                f"did you misspell RMCP_CAMERAS__{name}__PASSWORD?"
+            ) from e
+
+        # Redacted fallback — built only from e.errors()' loc/type, never
+        # the raw ValidationError object or any per-error field value.
+        details = "; ".join(
+            f"{'.'.join(str(p) for p in error['loc'])}: {error['type']}"
+            for error in e.errors()
+        )
+        raise SystemExit(f"config error: {details}") from e

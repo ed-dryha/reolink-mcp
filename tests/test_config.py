@@ -1,11 +1,14 @@
 """Tests for the config layer's named-map Settings and two-stage validation.
 
-Five behaviors (CONN-01, CONN-02):
+Six behaviors (CONN-01, CONN-02):
 1. YAML topology + env-var password merges into a valid Settings.cameras entry.
 2. A `password:` key in YAML is a named, loud SystemExit (never read from YAML).
 3. A missing RMCP_CAMERAS__<name>__PASSWORD env var is a named, loud SystemExit.
 4. A mixed-case camera name is a named, loud SystemExit (env var case folding).
 5. A missing config file is a named, loud SystemExit naming RMCP_CONFIG_FILE.
+6. A phantom-camera env var (password set for a name absent from YAML) never
+   leaks the password value — a curated "no camera named" SystemExit instead
+   (CR-01 / G1 regression guard).
 """
 
 import pytest
@@ -78,3 +81,29 @@ def test_missing_config_file_is_rejected(tmp_path, monkeypatch):
 
     with pytest.raises(SystemExit, match=r"RMCP_CONFIG_FILE"):
         load_settings()
+
+
+def test_phantom_camera_env_var_never_leaks_password(tmp_config, monkeypatch):
+    """CR-01 / G1 regression: an env var password set for a camera name
+    absent from YAML (typo, rename, or a WR-06 double-underscore split)
+    must never leak its plaintext password value via pydantic's
+    ValidationError.input_value, and must raise a curated, self-correcting
+    message instead of the redacted-but-generic fallback."""
+    tmp_config.write_text(
+        "cameras:\n"
+        "  front_door:\n"
+        "    host: 192.168.1.10\n"
+        "    username: admin\n"
+    )
+    monkeypatch.setenv("RMCP_CAMERAS__front_door__PASSWORD", "secret1")
+    secret_value = "SUPER-SECRET-HUNTER2"
+    monkeypatch.setenv("RMCP_CAMERAS__typo_cam__PASSWORD", secret_value)
+
+    with pytest.raises(SystemExit) as exc_info:
+        load_settings()
+
+    message = str(exc_info.value)
+    assert secret_value not in message
+    assert "input_value" not in message
+    assert "typo_cam" in message
+    assert "no camera named" in message
