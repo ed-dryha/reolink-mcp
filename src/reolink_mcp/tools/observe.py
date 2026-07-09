@@ -35,6 +35,14 @@ from reolink_mcp.errors import CameraError, classify_reolink_error
 # the dynamic-extension loop in get_recent_events itself (D-07).
 BASELINE_AI_TYPES = [PERSON_DETECTION_TYPE, VEHICLE_DETECTION_TYPE, PET_DETECTION_TYPE]
 
+# Single source of truth for the raw-wire-key-to-friendly-name conversion —
+# consumed by both get_capabilities and get_recent_events so the output
+# vocabulary stays friendly-name-only throughout (WR-02).
+RAW_TO_FRIENDLY_AI_TYPES = {
+    "people": PERSON_DETECTION_TYPE,
+    "dog_cat": PET_DETECTION_TYPE,
+}
+
 
 def _is_auth_or_session_failure(exc: ReolinkError) -> bool:
     """True for exceptions that mean "don't bother retrying the next stream"
@@ -248,11 +256,14 @@ async def get_capabilities(
     caps: dict[str, Any] = {
         "camera": camera,
         **{key: gate(handle, key) for key in CAPABILITY_MAP},
-        "ai_detection_types": host.ai_supported_types(ch),
+        "ai_detection_types": [
+            RAW_TO_FRIENDLY_AI_TYPES.get(t, t) for t in host.ai_supported_types(ch)
+        ],
     }
     if full:
         caps["raw_capabilities"] = sorted(host.capabilities.get(ch, set()))
         caps["siren_schedule"] = host.supported(ch, "siren")
+        caps["raw_ai_types"] = host.ai_supported_types(ch)
     return caps
 
 
@@ -338,7 +349,11 @@ async def get_states(
         "age_seconds": round(age, 1),
     }
     if full:
-        result["status_led"] = host.status_led_enabled(ch)
+        result["status_led"] = (
+            host.status_led_enabled(ch)
+            if host.supported(ch, "status_led")
+            else "unsupported"
+        )
         result["battery_percentage"] = (
             host.battery_percentage(ch) if host.is_battery else None
         )
@@ -405,9 +420,7 @@ async def get_recent_events(
         else:
             report[detect_type] = "unsupported"
     for raw_type in host.ai_supported_types(ch):
-        friendly = {"people": PERSON_DETECTION_TYPE, "dog_cat": PET_DETECTION_TYPE}.get(
-            raw_type, raw_type
-        )
+        friendly = RAW_TO_FRIENDLY_AI_TYPES.get(raw_type, raw_type)
         if friendly in seen:
             continue
         seen.add(friendly)
