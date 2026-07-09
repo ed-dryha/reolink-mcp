@@ -81,7 +81,9 @@ def manager_factory(monkeypatch: pytest.MonkeyPatch):
     construction is monkeypatched to always resolve to the given mock host
     (RESEARCH.md's verified mock-seam pattern)."""
 
-    def make_manager(cameras: dict[str, CameraConfig], mock_host: Host) -> CameraManager:
+    def make_manager(
+        cameras: dict[str, CameraConfig], mock_host: Host
+    ) -> CameraManager:
         monkeypatch.setattr("reolink_mcp.manager.Host", lambda **kwargs: mock_host)
         return CameraManager(cameras)
 
