@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "reolink": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "reolink_mcp"]
+    }
+  }
+}

@@ -26,6 +26,11 @@ packages = ["src/reolink_mcp"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "T201"]
 
+[tool.ruff.lint.per-file-ignores]
+# T201 protects the *server's* stdout (stdio JSON-RPC transport). QA/dev
+# scripts are client-side CLIs where printing is the point.
+"scripts/*" = ["T201"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
