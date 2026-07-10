@@ -21,7 +21,12 @@ import logging
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from reolink_mcp.tools.control import set_siren
+from reolink_mcp.tools.control import (
+    set_ir_lights,
+    set_siren,
+    set_spotlight,
+    set_white_led,
+)
 from reolink_mcp.tools.observe import (
     get_capabilities,
     get_device_info,
@@ -84,5 +89,20 @@ def register_all(mcp: FastMCP, read_only: bool = False) -> None:
                 readOnlyHint=False, destructiveHint=True, idempotentHint=False
             )
         )(set_siren)
+        mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=True
+            )
+        )(set_spotlight)
+        mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=True
+            )
+        )(set_ir_lights)
+        mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=True
+            )
+        )(set_white_led)
     else:
-        logger.warning("read-only mode: %d control tools disabled", 1)
+        logger.warning("read-only mode: %d control tools disabled", 4)

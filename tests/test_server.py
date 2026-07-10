@@ -50,4 +50,7 @@ async def test_read_only_unset_registers_control_tools_at_real_import(
     importlib.reload(reolink_mcp.server)
     tools = await reolink_mcp.server.mcp.list_tools()
 
-    assert len(tools) == 7
+    # 6 observe tools + set_siren/set_spotlight/set_ir_lights/set_white_led
+    # (Task 2 of this plan) — Plan 03-02 will need its own count update when
+    # it adds the remaining five control tools.
+    assert len(tools) == 10
