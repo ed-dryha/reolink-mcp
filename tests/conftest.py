@@ -1,5 +1,7 @@
 """Shared pytest fixtures for reolink-mcp tests."""
 
+import os
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, create_autospec
 
@@ -8,8 +10,28 @@ from pydantic import SecretStr
 from reolink_aio.api import Host
 from reolink_aio.exceptions import ReolinkConnectionError
 
-from reolink_mcp.config import CameraConfig
-from reolink_mcp.manager import CameraManager
+# Collection-time hermeticity stub (BLOCKER 1, 03-01-PLAN.md Task 1):
+# `server.py`'s module-scope `settings = load_settings()` makes any bare
+# `import reolink_mcp.server` config-dependent — including
+# `tests/test_server.py`'s own module-top `import reolink_mcp.server`,
+# which pytest executes during COLLECTION, before any fixture (including
+# `tmp_config` below) has run. On a host with no
+# `~/.config/reolink-mcp/config.yaml` and no `RMCP_CONFIG_FILE` set, that
+# collection-time call would raise `SystemExit` and abort the entire test
+# run. This block guarantees collection can never depend on the host
+# machine's state: it points RMCP_CONFIG_FILE at a throwaway, always-valid
+# stub config before any `reolink_mcp` import happens (including this
+# file's own imports below). Every actual test still drives its own real
+# config via the `tmp_config` fixture, which monkeypatches
+# RMCP_CONFIG_FILE/CONFIG_PATH at function scope and fully overrides this
+# stub for the duration of that test.
+_collection_stub_dir = tempfile.mkdtemp(prefix="reolink-mcp-collection-stub-")
+_collection_stub_config = Path(_collection_stub_dir) / "config.yaml"
+_collection_stub_config.write_text("cameras: {}\n")
+os.environ["RMCP_CONFIG_FILE"] = str(_collection_stub_config)
+
+from reolink_mcp.config import CameraConfig  # noqa: E402
+from reolink_mcp.manager import CameraManager  # noqa: E402
 
 
 @pytest.fixture

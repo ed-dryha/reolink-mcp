@@ -1,6 +1,6 @@
 """Tests for the config layer's named-map Settings and two-stage validation.
 
-Six behaviors (CONN-01, CONN-02):
+Eight behaviors (CONN-01, CONN-02, SAFE-02):
 1. YAML topology + env-var password merges into a valid Settings.cameras entry.
 2. A `password:` key in YAML is a named, loud SystemExit (never read from YAML).
 3. A missing RMCP_CAMERAS__<name>__PASSWORD env var is a named, loud SystemExit.
@@ -9,6 +9,8 @@ Six behaviors (CONN-01, CONN-02):
 6. A phantom-camera env var (password set for a name absent from YAML) never
    leaks the password value — a curated "no camera named" SystemExit instead
    (CR-01 / G1 regression guard).
+7. RMCP_READ_ONLY unset -> settings.read_only defaults to False.
+8. RMCP_READ_ONLY=true -> settings.read_only is True.
 """
 
 import pytest
@@ -107,3 +109,33 @@ def test_phantom_camera_env_var_never_leaks_password(tmp_config, monkeypatch):
     assert "input_value" not in message
     assert "typo_cam" in message
     assert "no camera named" in message
+
+
+def test_read_only_defaults_to_false_when_unset(tmp_config, monkeypatch):
+    tmp_config.write_text(
+        "cameras:\n"
+        "  front_door:\n"
+        "    host: 192.168.1.10\n"
+        "    username: admin\n"
+    )
+    monkeypatch.setenv("RMCP_CAMERAS__front_door__PASSWORD", "secret1")
+    monkeypatch.delenv("RMCP_READ_ONLY", raising=False)
+
+    settings = load_settings()
+
+    assert settings.read_only is False
+
+
+def test_read_only_true_when_env_var_set(tmp_config, monkeypatch):
+    tmp_config.write_text(
+        "cameras:\n"
+        "  front_door:\n"
+        "    host: 192.168.1.10\n"
+        "    username: admin\n"
+    )
+    monkeypatch.setenv("RMCP_CAMERAS__front_door__PASSWORD", "secret1")
+    monkeypatch.setenv("RMCP_READ_ONLY", "true")
+
+    settings = load_settings()
+
+    assert settings.read_only is True

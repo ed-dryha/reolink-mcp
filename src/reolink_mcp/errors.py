@@ -24,8 +24,10 @@ import logging
 
 from reolink_aio.exceptions import (
     CredentialsInvalidError,
+    InvalidParameterError,
     LoginError,
     LoginPrivacyModeError,
+    NotSupportedError,
     ReolinkConnectionError,
     ReolinkTimeoutError,
 )
@@ -83,6 +85,36 @@ def classify_reolink_error(exc: Exception, camera_name: str, host: str) -> str:
 
     logger.debug(
         "classify_reolink_error camera=%s host=%s exc=%r -> %s",
+        camera_name,
+        host,
+        exc,
+        message,
+    )
+    return message
+
+
+def classify_control_error(exc: Exception, camera_name: str, host: str) -> str:
+    """Translate a control-tool exception into a curated, actionable message
+    (Pitfall 8, 03-RESEARCH.md).
+
+    `InvalidParameterError`/`NotSupportedError` are curated here explicitly:
+    their `str(exc)` is safe to surface (built from static strings + non-
+    secret values, T-03-05) but always carries a leading `func_name: `
+    prefix from reolink-aio's own raise sites — stripped before it reaches
+    the tool response. Every other exception type delegates entirely to
+    `classify_reolink_error()` — this function never duplicates that
+    matcher table.
+    """
+    if isinstance(exc, (InvalidParameterError, NotSupportedError)):
+        detail = str(exc)
+        if ":" in detail:
+            detail = detail.split(":", 1)[1].strip()
+        message = f"camera '{camera_name}' rejected the request — {detail}"
+    else:
+        message = classify_reolink_error(exc, camera_name, host)
+
+    logger.debug(
+        "classify_control_error camera=%s host=%s exc=%r -> %s",
         camera_name,
         host,
         exc,

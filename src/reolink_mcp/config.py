@@ -110,6 +110,7 @@ class Settings(BaseSettings):
     )
 
     cameras: dict[str, CameraConfig]
+    read_only: bool = False
 
     @classmethod
     def settings_customise_sources(
