@@ -1,7 +1,8 @@
 """Control tools (state-mutating): `set_siren` (Phase 3 Plan 1); `set_spotlight`,
 `set_ir_lights`, `set_white_led` (Phase 3 Plan 1, Task 2); `set_zoom` (Phase 3
 Plan 2, Task 1); `list_presets`, `ptz_move_to_preset`, `ptz_position`
-(Phase 3 Plan 2, Task 2).
+(Phase 3 Plan 2, Task 2); `ptz_guard` (Phase 3 Plan 3, Task 1 — the ninth and
+final control tool).
 
 Tool functions here are plain, undecorated `async def`s — registration with
 `ToolAnnotations` happens explicitly in `tools/__init__.py`'s
@@ -404,4 +405,71 @@ async def ptz_position(camera: str, ctx: Context) -> dict[str, Any]:
         "tilt": tilt,
         "zoom": zoom_val,
         "at_preset": at_preset,
+    }
+
+
+async def ptz_guard(
+    camera: str, ctx: Context, action: Literal["set", "goto", "enable", "disable"]
+) -> dict[str, Any]:
+    """Configure `camera`'s PTZ guard position/auto-return via one `action`
+    parameter — `set`/`goto`/`enable`/`disable` (CTRL-09, D-10).
+
+    `action="set"` saves the CURRENT physical position as the guard point
+    (`command="setPos"`); `action="goto"` moves the camera to the saved
+    guard point (`command="toPos"`), then waits `PTZ_SETTLE_WAIT_S` and
+    force-repolls pan/tilt via `host.baichuan.get_ptz_position()` — the same
+    settle-wait + re-poll pattern `ptz_move_to_preset` uses, since
+    `SetPtzGuard`'s `"toPos"` variant does not refresh position either
+    (Pattern 4).
+
+    `action` in (`enable`, `disable`) deliberately BYPASSES
+    `host.set_ptz_guard()`'s own wrapper via a hand-built `send_setting()`
+    body containing only `channel`/`benable` — the wrapper's `command=None`
+    default always forces the position-resave command string internally
+    (see 03-RESEARCH.md Pitfall 7 for the exact literal), which re-saves the
+    CURRENT physical position as the guard point any time enable/disable is
+    called. Omitting that command-string field and the position-resave flag
+    entirely means toggling auto-return never touches the saved guard
+    position. `channel` is server-derived from the already-gated handle and
+    `benable` is a fixed 1/0 from the `Literal["enable", "disable"]`
+    argument — no free-form value reaches the wire body (T-03-15)."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not gate(handle, "ptz_guard"):
+        raise CameraError(refusal_message(camera, "ptz_guard"))
+    host, ch = handle.host, handle.channel
+
+    try:
+        if action == "set":
+            await host.set_ptz_guard(ch, command="setPos")
+        elif action == "goto":
+            await host.set_ptz_guard(ch, command="toPos")
+            await asyncio.sleep(PTZ_SETTLE_WAIT_S)
+            await host.baichuan.get_ptz_position(ch)
+        else:
+            await host.send_setting(
+                [
+                    {
+                        "cmd": "SetPtzGuard",
+                        "action": 0,
+                        "param": {
+                            "PtzGuard": {
+                                "channel": ch,
+                                "benable": 1 if action == "enable" else 0,
+                            }
+                        },
+                    }
+                ]
+            )
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
+
+    return {
+        "camera": camera,
+        "ptz_guard": {
+            "enabled": host.ptz_guard_enabled(ch),
+            "return_time_s": host.ptz_guard_time(ch),
+        },
     }

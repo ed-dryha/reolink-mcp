@@ -25,6 +25,7 @@ from reolink_mcp.manager import CameraManager
 from reolink_mcp.tools import register_all
 from reolink_mcp.tools.control import (
     list_presets,
+    ptz_guard,
     ptz_move_to_preset,
     ptz_position,
     set_ir_lights,
@@ -33,6 +34,35 @@ from reolink_mcp.tools.control import (
     set_white_led,
     set_zoom,
 )
+
+# Plan 03-03 Task 1: the full, final 15-tool registry (6 observe + 9
+# control) — the literal name sets SAFE-01/SAFE-02's hard regression tests
+# assert against, defined once here to avoid drift between the two tests.
+_ALL_FIFTEEN_TOOL_NAMES = {
+    "list_cameras",
+    "get_snapshot",
+    "get_device_info",
+    "get_capabilities",
+    "get_states",
+    "get_recent_events",
+    "set_siren",
+    "set_spotlight",
+    "set_ir_lights",
+    "set_white_led",
+    "set_zoom",
+    "list_presets",
+    "ptz_move_to_preset",
+    "ptz_position",
+    "ptz_guard",
+}
+_SIX_OBSERVE_TOOL_NAMES = {
+    "list_cameras",
+    "get_snapshot",
+    "get_device_info",
+    "get_capabilities",
+    "get_states",
+    "get_recent_events",
+}
 
 
 def _fake_ctx(manager: CameraManager) -> SimpleNamespace:
@@ -102,6 +132,16 @@ def _configure_pan_tilt_capable(
     host.supported = _per_string_supported(caps)
     host.ptz_pan_position = lambda channel: pan
     host.ptz_tilt_position = lambda channel: tilt
+
+
+def _configure_ptz_guard_capable(
+    host, *, enabled: bool = True, return_time_s: int = 60
+) -> None:
+    host.supported = _per_string_supported({"ptz_guard": True})
+    host.set_ptz_guard = AsyncMock()
+    host.send_setting = AsyncMock()
+    host.ptz_guard_enabled = lambda channel: enabled
+    host.ptz_guard_time = lambda channel: return_time_s
 
 
 # ---------------------------------------------------------------------------
@@ -787,17 +827,159 @@ async def test_ptz_position_gate_failure_refuses_without_awaiting(
 
 
 # ---------------------------------------------------------------------------
+# ptz_guard (CTRL-09, D-10, D-14, Pitfall 7)
+# ---------------------------------------------------------------------------
+
+
+async def test_ptz_guard_set_calls_set_ptz_guard_with_setpos(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_guard_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await ptz_guard("front_door", _fake_ctx(manager), action="set")
+
+    host.set_ptz_guard.assert_awaited_once_with(0, command="setPos")
+    host.send_setting.assert_not_awaited()
+
+
+async def test_ptz_guard_goto_calls_set_ptz_guard_with_topos_and_repolls_position(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_guard_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await ptz_guard("front_door", _fake_ctx(manager), action="goto")
+
+    host.set_ptz_guard.assert_awaited_once_with(0, command="toPos")
+    host.baichuan.get_ptz_position.assert_awaited_once_with(0)
+
+
+async def test_ptz_guard_enable_uses_send_setting_bypass_avoiding_position_resave(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_guard_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await ptz_guard("front_door", _fake_ctx(manager), action="enable")
+
+    host.send_setting.assert_awaited_once_with(
+        [
+            {
+                "cmd": "SetPtzGuard",
+                "action": 0,
+                "param": {"PtzGuard": {"channel": 0, "benable": 1}},
+            }
+        ]
+    )
+    host.set_ptz_guard.assert_not_awaited()
+    # Pitfall 7 regression guard: the hand-built body must never resave the
+    # current physical position as the guard point.
+    body = host.send_setting.await_args.args[0]
+    serialized = str(body)
+    assert "cmdStr" not in serialized
+    assert "bSaveCurrentPos" not in serialized
+
+
+async def test_ptz_guard_disable_uses_send_setting_bypass(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_guard_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await ptz_guard("front_door", _fake_ctx(manager), action="disable")
+
+    host.send_setting.assert_awaited_once_with(
+        [
+            {
+                "cmd": "SetPtzGuard",
+                "action": 0,
+                "param": {"PtzGuard": {"channel": 0, "benable": 0}},
+            }
+        ]
+    )
+    host.set_ptz_guard.assert_not_awaited()
+    body = host.send_setting.await_args.args[0]
+    serialized = str(body)
+    assert "cmdStr" not in serialized
+    assert "bSaveCurrentPos" not in serialized
+
+
+async def test_ptz_guard_gate_failure_refuses_without_any_host_call(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    host.supported = _per_string_supported({"ptz_guard": False})
+    host.set_ptz_guard = AsyncMock()
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await ptz_guard("front_door", _fake_ctx(manager), action="set")
+
+    assert refusal_message("front_door", "ptz_guard") in str(exc_info.value)
+    host.set_ptz_guard.assert_not_awaited()
+    host.send_setting.assert_not_awaited()
+    host.baichuan.get_ptz_position.assert_not_awaited()
+
+
+@pytest.mark.parametrize("action", ["set", "goto", "enable", "disable"])
+async def test_ptz_guard_success_returns_read_back_dict(
+    action, mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_guard_capable(host, enabled=True, return_time_s=45)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await ptz_guard("front_door", _fake_ctx(manager), action=action)
+
+    assert result == {
+        "camera": "front_door",
+        "ptz_guard": {"enabled": True, "return_time_s": 45},
+    }
+
+
+async def test_ptz_guard_host_error_translated_to_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_guard_capable(host)
+    host.set_ptz_guard = AsyncMock(
+        side_effect=InvalidParameterError("set_ptz_guard: invalid channel")
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await ptz_guard("front_door", _fake_ctx(manager), action="set")
+
+    assert "set_ptz_guard" not in str(exc_info.value) or "rejected" in str(
+        exc_info.value
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registration + RMCP_READ_ONLY (SAFE-02, D-13)
 # ---------------------------------------------------------------------------
 
 
-async def test_register_all_not_read_only_registers_fourteen_tools():
+async def test_register_all_not_read_only_registers_fifteen_tools():
     test_mcp = FastMCP("probe-annotations")
     register_all(test_mcp, read_only=False)
 
     tools = await test_mcp.list_tools()
 
-    assert len(tools) == 14
+    assert len(tools) == 15
     names = {t.name for t in tools}
     assert {
         "set_siren",
@@ -808,6 +990,7 @@ async def test_register_all_not_read_only_registers_fourteen_tools():
         "list_presets",
         "ptz_move_to_preset",
         "ptz_position",
+        "ptz_guard",
     } <= names
 
 
@@ -828,7 +1011,55 @@ async def test_register_all_read_only_registers_six_tools_no_control_tools():
         "list_presets",
         "ptz_move_to_preset",
         "ptz_position",
+        "ptz_guard",
     } & names
+
+
+async def test_register_all_exact_tool_name_sets_for_both_modes():
+    """SAFE-02 hard regression guard: the registered tool-NAME sets must
+    equal the literal full/observe-only sets exactly — a single missed
+    `if not read_only:` indentation mistake would be caught here even if
+    the plain tool-count assertions above happened to still pass."""
+    full_mcp = FastMCP("probe-full")
+    register_all(full_mcp, read_only=False)
+    full_names = {t.name for t in await full_mcp.list_tools()}
+
+    read_only_mcp = FastMCP("probe-read-only")
+    register_all(read_only_mcp, read_only=True)
+    read_only_names = {t.name for t in await read_only_mcp.list_tools()}
+
+    assert full_names == _ALL_FIFTEEN_TOOL_NAMES
+    assert read_only_names == _SIX_OBSERVE_TOOL_NAMES
+
+
+async def test_full_registry_annotation_completeness_and_d13_matrix():
+    """SAFE-01 hard regression guard: every one of the 15 registered tools
+    (not a spot-check subset) must carry explicit, non-None
+    readOnlyHint/destructiveHint/idempotentHint values, plus the D-13
+    matrix invariants (destructiveHint True on set_siren only; readOnlyHint
+    True for the 6 observe tools, False for the 9 control tools)."""
+    test_mcp = FastMCP("probe-completeness")
+    register_all(test_mcp, read_only=False)
+    tools = await test_mcp.list_tools()
+
+    assert {t.name for t in tools} == _ALL_FIFTEEN_TOOL_NAMES
+
+    for tool in tools:
+        assert tool.annotations is not None, f"{tool.name} missing annotations"
+        assert tool.annotations.readOnlyHint is not None, tool.name
+        assert tool.annotations.destructiveHint is not None, tool.name
+        assert tool.annotations.idempotentHint is not None, tool.name
+
+    for tool in tools:
+        if tool.name == "set_siren":
+            assert tool.annotations.destructiveHint is True, tool.name
+        else:
+            assert tool.annotations.destructiveHint is False, tool.name
+
+        if tool.name in _SIX_OBSERVE_TOOL_NAMES:
+            assert tool.annotations.readOnlyHint is True, tool.name
+        else:
+            assert tool.annotations.readOnlyHint is False, tool.name
 
 
 async def test_observe_tools_carry_full_d13_annotation_matrix():
@@ -868,7 +1099,7 @@ async def test_set_siren_registered_with_destructive_hint_true():
 
 
 @pytest.mark.parametrize(
-    "tool_name", ["set_spotlight", "set_ir_lights", "set_white_led"]
+    "tool_name", ["set_spotlight", "set_ir_lights", "set_white_led", "ptz_guard"]
 )
 async def test_low_friction_control_tools_registered_with_destructive_hint_false(
     tool_name,
