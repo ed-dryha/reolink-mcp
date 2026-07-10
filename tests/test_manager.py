@@ -57,6 +57,9 @@ async def test_get_caches_handle_after_first_connect(
     # Phase 2 Plan 2 (Pitfall 1 guard): connect must NOT set states_polled_at
     # — only get_states/get_recent_events do, on their own first call.
     assert handle1.states_polled_at is None
+    # Phase 3 Plan 2 (D-11, Pitfall 6): preset_positions starts empty — only
+    # ptz_move_to_preset populates it, never the connect path.
+    assert handle1.preset_positions == {}
 
 
 async def test_get_raises_camera_error_matching_classifier(

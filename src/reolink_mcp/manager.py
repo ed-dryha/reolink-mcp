@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from reolink_aio.api import Host
@@ -45,6 +45,12 @@ class CameraHandle:
     `channel` is always 0 in Phase 1 (standalone cameras only); NVR/
     multi-channel support is a config-layer change for a future version
     (ARCHITECTURE.md Pattern 3).
+
+    `preset_positions` is a session-scoped, never-persisted cache mapping
+    PTZ preset ID to the `(pan, tilt)` position observed the last time
+    `ptz_move_to_preset` (Phase 3 Plan 2) visited it — reolink-aio itself has
+    no preset<->position API, so this is genuinely new server-owned state
+    (D-11, 03-RESEARCH.md Pitfall 6), cleared on every process restart.
     """
 
     name: str
@@ -52,6 +58,7 @@ class CameraHandle:
     channel: int
     connected: bool = True
     states_polled_at: datetime | None = None
+    preset_positions: dict[int, tuple[int, int]] = field(default_factory=dict)
 
 
 class CameraManager:

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, create_autospec
 import pytest
 from pydantic import SecretStr
 from reolink_aio.api import Host
+from reolink_aio.baichuan import Baichuan
 from reolink_aio.exceptions import ReolinkConnectionError
 
 # Collection-time hermeticity stub (BLOCKER 1, 03-01-PLAN.md Task 1):
@@ -113,6 +114,13 @@ def mock_host_factory():
         mock.model = "RLC-810A"
         mock.host = "192.168.1.44"
         mock.logout = AsyncMock()
+        # create_autospec(Host, instance=True) alone does not expose
+        # `.baichuan` at all (confirmed empirically — raises AttributeError):
+        # `baichuan` is a plain instance attribute assigned inside
+        # `Host.__init__`, never visible to create_autospec's class-level
+        # introspection (03-RESEARCH.md Pattern 5). Required before any
+        # PTZ-position test (Phase 3 Plan 2) can run.
+        mock.baichuan = create_autospec(Baichuan, instance=True)
         return mock
 
     return make_mock_host

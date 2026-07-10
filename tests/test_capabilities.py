@@ -58,6 +58,8 @@ def test_gate_white_led_uses_floodlight():
         ("ir_lights", "ir_lights"),
         ("day_night", "dayNight"),
         ("motion_detection", "motion_detection"),
+        ("pan_tilt", "pan_tilt"),
+        ("ptz_guard", "ptz_guard"),
     ],
 )
 def test_gate_maps_curated_key_to_exact_raw_string(capability, raw_string):
@@ -66,7 +68,7 @@ def test_gate_maps_curated_key_to_exact_raw_string(capability, raw_string):
     assert gate(handle, capability) is True
 
 
-def test_capability_map_has_exactly_seven_entries():
+def test_capability_map_has_exactly_nine_entries():
     assert CAPABILITY_MAP == {
         "zoom": "zoom",
         "ir_lights": "ir_lights",
@@ -75,6 +77,8 @@ def test_capability_map_has_exactly_seven_entries():
         "ptz_presets": "ptz_presets",
         "day_night": "dayNight",
         "motion_detection": "motion_detection",
+        "pan_tilt": "pan_tilt",
+        "ptz_guard": "ptz_guard",
     }
 
 

@@ -24,6 +24,12 @@ from __future__ import annotations
 #     feature, not the set_siren trigger this project's CTRL-01 wraps.
 #   - "ptz_presets" maps to "ptz_presets", never "ptz" — Pitfall 4: "ptz" is
 #     true for any motorized optic including zoom-only cameras.
+#   - "pan_tilt" and "ptz_guard" (Phase 3 Plan 2) are exact 1:1 matches with
+#     no alias gotcha, unlike the two cases above — but both are populated
+#     exclusively by the Baichuan (TCP port 9000) subsystem's own discovery
+#     pass, not the HTTP-side `construct_capabilities()` (03-RESEARCH.md
+#     Pattern 5/finding 3), which is worth noting for future maintainers
+#     even though it changes no code behavior here.
 CAPABILITY_MAP: dict[str, str] = {
     "zoom": "zoom",
     "ir_lights": "ir_lights",
@@ -32,6 +38,8 @@ CAPABILITY_MAP: dict[str, str] = {
     "ptz_presets": "ptz_presets",
     "day_night": "dayNight",
     "motion_detection": "motion_detection",
+    "pan_tilt": "pan_tilt",
+    "ptz_guard": "ptz_guard",
 }
 
 

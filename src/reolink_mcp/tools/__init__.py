@@ -22,6 +22,9 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from reolink_mcp.tools.control import (
+    list_presets,
+    ptz_move_to_preset,
+    ptz_position,
     set_ir_lights,
     set_siren,
     set_spotlight,
@@ -110,5 +113,20 @@ def register_all(mcp: FastMCP, read_only: bool = False) -> None:
                 readOnlyHint=False, destructiveHint=False, idempotentHint=False
             )
         )(set_zoom)
+        mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=True
+            )
+        )(list_presets)
+        mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=True
+            )
+        )(ptz_move_to_preset)
+        mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=True
+            )
+        )(ptz_position)
     else:
-        logger.warning("read-only mode: %d control tools disabled", 5)
+        logger.warning("read-only mode: %d control tools disabled", 8)
