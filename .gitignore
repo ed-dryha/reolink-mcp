@@ -10,3 +10,5 @@ config.yaml
 .env
 .DS_Store
 .planning/
+.vscode/
+qa-snapshots/
