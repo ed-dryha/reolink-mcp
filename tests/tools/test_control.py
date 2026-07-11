@@ -698,7 +698,9 @@ async def test_set_zoom_host_error_translated_to_camera_error(
     with pytest.raises(CameraError) as exc_info:
         await set_zoom("front_door", _fake_ctx(manager), position=50)
 
-    assert "set_zoom" not in str(exc_info.value) or "rejected" in str(exc_info.value)
+    msg = str(exc_info.value)
+    assert "rejected" in msg
+    assert "set_zoom:" not in msg  # func_name prefix must be stripped
 
 
 async def test_set_zoom_unpopulated_range_read_translated_to_camera_error(
@@ -1166,9 +1168,9 @@ async def test_ptz_guard_host_error_translated_to_camera_error(
     with pytest.raises(CameraError) as exc_info:
         await ptz_guard("front_door", _fake_ctx(manager), action="set")
 
-    assert "set_ptz_guard" not in str(exc_info.value) or "rejected" in str(
-        exc_info.value
-    )
+    msg = str(exc_info.value)
+    assert "rejected" in msg
+    assert "set_ptz_guard:" not in msg  # func_name prefix must be stripped
 
 
 # ---------------------------------------------------------------------------
