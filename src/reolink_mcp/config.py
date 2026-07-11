@@ -1,9 +1,9 @@
 """Camera configuration: YAML topology + env-var-only secrets.
 
 Two-stage validation (Pattern 2, 01-RESEARCH.md):
-  1. `validate_yaml_shape()` rejects any `password:` key present in YAML and
-     any camera name that isn't lowercase snake_case, before pydantic-settings
-     ever runs.
+  1. `validate_yaml_shape()` rejects any secret-like key (`password:`,
+     `Password:`, `secret:`, ...) present in YAML and any camera name that
+     isn't lowercase snake_case, before pydantic-settings ever runs.
   2. `Settings()` (pydantic-settings) merges the YAML topology with
      `RMCP_CAMERAS__<name>__PASSWORD` env vars into the final `CameraConfig`
      (`password: SecretStr`, required, never sourced from YAML).
@@ -41,6 +41,11 @@ from pydantic_settings import (
 )
 
 _CAMERA_NAME_RE = re.compile(r"[a-z0-9_]+")
+
+# Any rejected extra YAML key that looks like it carries a secret gets the
+# curated CONN-02 message. Matched case-insensitively against the key *name*
+# only — key names are safe to echo; values never are (CR-01).
+_SECRET_KEY_RE = re.compile(r"pass|secret|token|credential", re.IGNORECASE)
 
 
 def resolve_config_path() -> Path:
@@ -134,8 +139,12 @@ def validate_yaml_shape(raw_cameras: dict[str, dict]) -> None:
     """Validate raw YAML camera entries before pydantic-settings ever runs.
 
     Rejects: camera names that aren't lowercase snake_case (env var override
-    matching requires it — Pitfall C) and any `password` key present in YAML
-    (passwords are env-var only — CONN-02).
+    matching requires it — Pitfall C) and any secret-like key present in YAML
+    (`password`, `Password`, `passwd`, `secret`, `token`, ... — passwords are
+    env-var only, CONN-02). Failure messages are built only from
+    `e.errors()`' loc/type, never the raw `ValidationError` (CR-01):
+    pydantic embeds each rejected field's plaintext value via
+    `input_value=...` in `str(ValidationError)`.
     """
     for name, entry in raw_cameras.items():
         if not _CAMERA_NAME_RE.fullmatch(name):
@@ -148,13 +157,25 @@ def validate_yaml_shape(raw_cameras: dict[str, dict]) -> None:
         try:
             CameraYamlEntry(**entry)
         except ValidationError as e:
-            if "password" in str(e):
+            secret_keys = [
+                str(error["loc"][0])
+                for error in e.errors()
+                if error["type"] == "extra_forbidden"
+                and error["loc"]
+                and _SECRET_KEY_RE.search(str(error["loc"][0]))
+            ]
+            if secret_keys:
                 raise SystemExit(
-                    f"config error: camera '{name}' has a 'password' key "
-                    f"in YAML — passwords are never read from YAML. Remove "
-                    f"it and set RMCP_CAMERAS__{name}__PASSWORD instead."
+                    f"config error: camera '{name}' has a secret-like "
+                    f"'{secret_keys[0]}' key in YAML — passwords are never "
+                    f"read from YAML. Remove it and set "
+                    f"RMCP_CAMERAS__{name}__PASSWORD instead."
                 ) from e
-            raise SystemExit(f"config error: camera '{name}' — {e}") from e
+            details = "; ".join(
+                f"{'.'.join(str(p) for p in error['loc'])}: {error['type']}"
+                for error in e.errors()
+            )
+            raise SystemExit(f"config error: camera '{name}' — {details}") from e
 
 
 def load_settings() -> Settings:
