@@ -96,3 +96,12 @@ None - no external service configuration required. (PyPI Trusted Publishing setu
 ---
 *Phase: 04-packaging-release*
 *Completed: 2026-07-11*
+
+## Self-Check: PASSED
+
+- FOUND: README.md
+- FOUND: config.example.yaml
+- FOUND: .planning/phases/04-packaging-release/04-02-SUMMARY.md
+- FOUND: c56b40d (feat(04-02): add config.example.yaml)
+- FOUND: bb70471 (docs(04-02): rewrite README.md as public quickstart)
+- FOUND: 28ec0d5 (docs(04-02): add plan summary)
