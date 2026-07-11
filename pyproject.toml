@@ -1,9 +1,19 @@
 [project]
 name = "reolink-mcp"
-version = "0.1.0"
+version = "1.0.0"
 description = "MCP server for Reolink cameras: snapshots, device state, AI detection, PTZ, and deterrence controls over the local network."
+readme = "README.md"
+license = "MIT"
 authors = [
-    { name = "Eduard Dryha", email = "eduard_dryha@epam.com" }
+    { name = "Eduard Dryha", email = "edrygha@gmail.com" }
+]
+keywords = ["mcp", "reolink", "camera", "model-context-protocol", "home-security"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 requires-python = ">=3.11"
 dependencies = [
@@ -12,6 +22,12 @@ dependencies = [
     "pydantic-settings[yaml]>=2.14",
     "pillow",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ed-dryha/reolink-mcp"
+Repository = "https://github.com/ed-dryha/reolink-mcp"
+Issues = "https://github.com/ed-dryha/reolink-mcp/issues"
+Changelog = "https://github.com/ed-dryha/reolink-mcp/blob/main/CHANGELOG.md"
 
 [project.scripts]
 reolink-mcp = "reolink_mcp.__main__:main"
@@ -22,6 +38,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/reolink_mcp"]
+
+[[tool.uv.index]]
+name = "testpypi"
+url = "https://test.pypi.org/simple/"
+publish-url = "https://test.pypi.org/legacy/"
+explicit = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "T201"]

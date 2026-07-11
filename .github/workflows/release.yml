@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build & smoke-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      is_rehearsal: ${{ steps.classify.outputs.is_rehearsal }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+      - run: uv python install 3.13
+        shell: bash
+      - run: uv build
+        shell: bash
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+      - name: Packaging smoke check
+        run: uv run --isolated --no-project --with dist/*.whl python scripts/packaging_smoke.py
+        shell: bash
+      - name: Classify release channel
+        id: classify
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if [[ "$REF_NAME" == *-rc* ]]; then
+            echo "is_rehearsal=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_rehearsal=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ needs.build.outputs.is_rehearsal == 'true' && 'testpypi' || 'pypi' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+      - name: Publish to TestPyPI (rehearsal)
+        if: needs.build.outputs.is_rehearsal == 'true'
+        run: uv publish --index testpypi --trusted-publishing always
+        shell: bash
+      - name: Publish to PyPI
+        if: needs.build.outputs.is_rehearsal != 'true'
+        run: uv publish --trusted-publishing always
+        shell: bash
+
+  github-release:
+    name: Create GitHub Release
+    needs: [build, publish-pypi]
+    if: needs.build.outputs.is_rehearsal != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Extract CHANGELOG section
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          version="${REF_NAME#v}"
+          awk -v ver="## [$version]" '
+            index($0, ver) == 1 { printing = 1; next }
+            printing && /^## \[/ { exit }
+            printing && /^\[[^]]+\]:/ { exit }
+            printing { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No CHANGELOG.md section found for $REF_NAME (expected a '## [$version]' heading)" >&2
+            exit 1
+          fi
+      - name: Create GitHub Release
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release create "$REF_NAME" --title "$REF_NAME" --notes-file release-notes.md
+
+  publish-registry:
+    name: Publish to MCP Registry
+    needs: [build, publish-pypi]
+    if: needs.build.outputs.is_rehearsal != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install mcp-publisher
+        shell: bash
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+        shell: bash
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish
+        shell: bash

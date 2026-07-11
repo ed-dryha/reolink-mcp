@@ -1,0 +1,32 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ed-dryha/reolink-mcp",
+  "description": "MCP server for Reolink cameras: snapshots, device state, AI detection, PTZ, and deterrence controls over the local network.",
+  "repository": {
+    "url": "https://github.com/ed-dryha/reolink-mcp",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "reolink-mcp",
+      "version": "1.0.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "RMCP_CONFIG_FILE",
+          "description": "Path to the camera config YAML (default: ~/.config/reolink-mcp/config.yaml)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "RMCP_READ_ONLY",
+          "description": "Set to 'true' to strip all control tools and run observe-only",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
