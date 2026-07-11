@@ -1,0 +1,26 @@
+# reolink-mcp camera configuration.
+#
+# Copy this file to the default location the server reads:
+#   ~/.config/reolink-mcp/config.yaml
+# ...or point RMCP_CONFIG_FILE at a copy anywhere else on disk.
+#
+# Camera names (the keys under `cameras:` below) MUST be lowercase
+# snake_case — the RMCP_CAMERAS__<name>__PASSWORD env-var pattern below
+# matches on this exact name, and a name that isn't lowercase snake_case
+# is rejected at startup.
+#
+# Passwords are NEVER put in this file — only `host` and `username` are
+# accepted here. Set one password env var per camera instead:
+#   RMCP_CAMERAS__front_door__PASSWORD=<front door camera password>
+#   RMCP_CAMERAS__side_yard__PASSWORD=<side yard camera password>
+#
+# Set RMCP_READ_ONLY=true to start the server with all control tools
+# (siren, spotlight, IR/white LED, PTZ, zoom, ...) stripped — an
+# observe-only server with nothing control-capable exposed to the client.
+cameras:
+  front_door:
+    host: 192.168.1.44
+    username: admin
+  side_yard:
+    host: 192.168.1.45
+    username: admin
