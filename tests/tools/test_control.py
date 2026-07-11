@@ -28,6 +28,7 @@ from reolink_mcp.tools.control import (
     ptz_guard,
     ptz_move_to_preset,
     ptz_position,
+    set_audio_alarm,
     set_ir_lights,
     set_siren,
     set_spotlight,
@@ -35,10 +36,13 @@ from reolink_mcp.tools.control import (
     set_zoom,
 )
 
-# Plan 03-03 Task 1: the full, final 15-tool registry (6 observe + 9
-# control) — the literal name sets SAFE-01/SAFE-02's hard regression tests
-# assert against, defined once here to avoid drift between the two tests.
-_ALL_FIFTEEN_TOOL_NAMES = {
+# Plan 03-03 Task 1 (+ checkpoint deviation): the full, final 16-tool
+# registry (6 observe + 10 control) — the literal name sets SAFE-01/SAFE-02's
+# hard regression tests assert against, defined once here to avoid drift
+# between the two tests. `set_audio_alarm` was added during the Plan 03-03
+# hardware checkpoint after live P437 QA found `set_siren` silently
+# suppressed while the camera's audio-alarm feature is disabled.
+_ALL_SIXTEEN_TOOL_NAMES = {
     "list_cameras",
     "get_snapshot",
     "get_device_info",
@@ -46,6 +50,7 @@ _ALL_FIFTEEN_TOOL_NAMES = {
     "get_states",
     "get_recent_events",
     "set_siren",
+    "set_audio_alarm",
     "set_spotlight",
     "set_ir_lights",
     "set_white_led",
@@ -250,6 +255,83 @@ async def test_set_siren_host_error_translated_to_camera_error(
 
     with pytest.raises(CameraError) as exc_info:
         await set_siren("front_door", _fake_ctx(manager), action="sound")
+
+    assert "refused" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# set_audio_alarm (Plan 03-03 checkpoint deviation)
+# ---------------------------------------------------------------------------
+
+
+def _configure_audio_alarm_capable(host, *, enabled_readback: bool = True) -> None:
+    # Raw "siren" capability — deliberately NOT "siren_play" (Pitfall 3):
+    # SetAudioAlarm gates on the schedule capability, and the per-string
+    # dict lookup ensures a curated-key/raw-string mix-up in the tool would
+    # fail loudly here instead of passing on a blanket-True mock.
+    host.supported = _per_string_supported({"siren": True})
+    host.set_audio_alarm = AsyncMock()
+    host.audio_alarm_enabled = lambda channel: enabled_readback
+
+
+async def test_set_audio_alarm_enable_calls_host_and_returns_read_back(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_audio_alarm_capable(host, enabled_readback=True)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await set_audio_alarm("front_door", _fake_ctx(manager), enabled=True)
+
+    host.set_audio_alarm.assert_awaited_once_with(0, True)
+    assert result == {"camera": "front_door", "audio_alarm_enabled": True}
+
+
+async def test_set_audio_alarm_disable_calls_host_and_returns_read_back(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_audio_alarm_capable(host, enabled_readback=False)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await set_audio_alarm("front_door", _fake_ctx(manager), enabled=False)
+
+    host.set_audio_alarm.assert_awaited_once_with(0, False)
+    assert result == {"camera": "front_door", "audio_alarm_enabled": False}
+
+
+async def test_set_audio_alarm_gates_on_raw_siren_not_siren_play(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    # siren_play=True alone must NOT satisfy set_audio_alarm's gate — the
+    # tool gates on the raw "siren" (schedule) capability, mirroring
+    # reolink-aio's own set_audio_alarm() NotSupportedError check.
+    host.supported = _per_string_supported({"siren_play": True})
+    host.set_audio_alarm = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await set_audio_alarm("front_door", _fake_ctx(manager), enabled=True)
+
+    assert "audio alarm" in str(exc_info.value)
+    host.set_audio_alarm.assert_not_awaited()
+
+
+async def test_set_audio_alarm_host_error_translated_to_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_audio_alarm_capable(host)
+    host.set_audio_alarm = AsyncMock(side_effect=ReolinkConnectionError("refused"))
+    cameras = {"front_door": camera_config_factory(host="192.168.1.10")}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await set_audio_alarm("front_door", _fake_ctx(manager), enabled=True)
 
     assert "refused" not in str(exc_info.value)
 
@@ -973,16 +1055,17 @@ async def test_ptz_guard_host_error_translated_to_camera_error(
 # ---------------------------------------------------------------------------
 
 
-async def test_register_all_not_read_only_registers_fifteen_tools():
+async def test_register_all_not_read_only_registers_sixteen_tools():
     test_mcp = FastMCP("probe-annotations")
     register_all(test_mcp, read_only=False)
 
     tools = await test_mcp.list_tools()
 
-    assert len(tools) == 15
+    assert len(tools) == 16
     names = {t.name for t in tools}
     assert {
         "set_siren",
+        "set_audio_alarm",
         "set_spotlight",
         "set_ir_lights",
         "set_white_led",
@@ -1004,6 +1087,7 @@ async def test_register_all_read_only_registers_six_tools_no_control_tools():
     names = {t.name for t in tools}
     assert not {
         "set_siren",
+        "set_audio_alarm",
         "set_spotlight",
         "set_ir_lights",
         "set_white_led",
@@ -1028,21 +1112,21 @@ async def test_register_all_exact_tool_name_sets_for_both_modes():
     register_all(read_only_mcp, read_only=True)
     read_only_names = {t.name for t in await read_only_mcp.list_tools()}
 
-    assert full_names == _ALL_FIFTEEN_TOOL_NAMES
+    assert full_names == _ALL_SIXTEEN_TOOL_NAMES
     assert read_only_names == _SIX_OBSERVE_TOOL_NAMES
 
 
 async def test_full_registry_annotation_completeness_and_d13_matrix():
-    """SAFE-01 hard regression guard: every one of the 15 registered tools
+    """SAFE-01 hard regression guard: every one of the 16 registered tools
     (not a spot-check subset) must carry explicit, non-None
     readOnlyHint/destructiveHint/idempotentHint values, plus the D-13
     matrix invariants (destructiveHint True on set_siren only; readOnlyHint
-    True for the 6 observe tools, False for the 9 control tools)."""
+    True for the 6 observe tools, False for the 10 control tools)."""
     test_mcp = FastMCP("probe-completeness")
     register_all(test_mcp, read_only=False)
     tools = await test_mcp.list_tools()
 
-    assert {t.name for t in tools} == _ALL_FIFTEEN_TOOL_NAMES
+    assert {t.name for t in tools} == _ALL_SIXTEEN_TOOL_NAMES
 
     for tool in tools:
         assert tool.annotations is not None, f"{tool.name} missing annotations"
@@ -1099,7 +1183,8 @@ async def test_set_siren_registered_with_destructive_hint_true():
 
 
 @pytest.mark.parametrize(
-    "tool_name", ["set_spotlight", "set_ir_lights", "set_white_led", "ptz_guard"]
+    "tool_name",
+    ["set_audio_alarm", "set_spotlight", "set_ir_lights", "set_white_led", "ptz_guard"],
 )
 async def test_low_friction_control_tools_registered_with_destructive_hint_false(
     tool_name,

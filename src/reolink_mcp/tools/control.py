@@ -1,8 +1,11 @@
 """Control tools (state-mutating): `set_siren` (Phase 3 Plan 1); `set_spotlight`,
 `set_ir_lights`, `set_white_led` (Phase 3 Plan 1, Task 2); `set_zoom` (Phase 3
 Plan 2, Task 1); `list_presets`, `ptz_move_to_preset`, `ptz_position`
-(Phase 3 Plan 2, Task 2); `ptz_guard` (Phase 3 Plan 3, Task 1 — the ninth and
-final control tool).
+(Phase 3 Plan 2, Task 2); `ptz_guard` (Phase 3 Plan 3, Task 1 — the ninth
+planned control tool); `set_audio_alarm` (Phase 3 Plan 3, user-directed
+checkpoint deviation — live P437 QA found `set_siren` is silently suppressed
+by the camera while its audio-alarm feature is disabled, so enabling it must
+be reachable from MCP too).
 
 Tool functions here are plain, undecorated `async def`s — registration with
 `ToolAnnotations` happens explicitly in `tools/__init__.py`'s
@@ -116,6 +119,40 @@ async def set_siren(
         "duration": resolved_duration,
         "note": note,
     }
+
+
+async def set_audio_alarm(camera: str, ctx: Context, enabled: bool) -> dict[str, Any]:
+    """Enable or disable `camera`'s siren/audio-alarm feature.
+
+    When this feature is disabled on the camera, `set_siren` commands are
+    accepted by the firmware but produce NO audible sound (confirmed on a
+    live P437 during Phase 3 hardware QA) — so a silent siren should be
+    triaged by checking `get_states`'s `audio_alarm_enabled` field and, if
+    `false`, calling this tool with `enabled=true` before retrying.
+
+    Gates on the raw `"siren"` capability string directly — NOT the curated
+    `"siren"` key, which `CAPABILITY_MAP` deliberately maps to `"siren_play"`
+    (the manual-trigger capability `set_siren` wraps; Pitfall 3). The raw
+    `"siren"` capability is what reolink-aio's own `set_audio_alarm()` gates
+    on, and the same string `get_states`/`get_capabilities(full=True)` read
+    for `audio_alarm_enabled`/`siren_schedule`.
+
+    Read-back is fresh (D-14): `SetAudioAlarm`/`SetAudioAlarmV20` goes
+    through `send_setting()`, whose `Set*` auto-refetch re-polls the
+    corresponding `GetAudioAlarm` state before returning."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not handle.host.supported(handle.channel, "siren"):
+        raise CameraError(refusal_message(camera, "audio_alarm"))
+    host, ch = handle.host, handle.channel
+
+    try:
+        await host.set_audio_alarm(ch, enabled)
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
+    return {"camera": camera, "audio_alarm_enabled": host.audio_alarm_enabled(ch)}
 
 
 async def set_spotlight(camera: str, ctx: Context, on: bool) -> dict[str, Any]:
