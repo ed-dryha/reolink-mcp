@@ -804,6 +804,34 @@ async def test_ptz_move_to_preset_settle_wait_before_position_repoll(
     assert call_order == ["sleep", "get_ptz_position"]
 
 
+async def test_ptz_move_to_preset_repoll_failure_degrades_never_leaks_raw_text(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """CR-01: the move itself already succeeded, so a failed Baichuan re-poll
+    must degrade to pan/tilt=None with a note — never fail the call, never
+    surface the raw Baichuan exception text (which embeds wire hex dumps)."""
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1})
+    host.baichuan.get_ptz_position = AsyncMock(
+        side_effect=ReolinkConnectionError("baichuan header: deadbeefcafe")
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await ptz_move_to_preset(
+        "front_door", _fake_ctx(manager), preset="driveway"
+    )
+
+    host.set_ptz_command.assert_awaited_once_with(0, preset=1)
+    assert result["preset"] == "driveway"
+    assert result["pan"] is None
+    assert result["tilt"] is None
+    assert "re-poll" in result["note"]
+    assert "deadbeefcafe" not in str(result)
+    handle = await manager.get("front_door")
+    assert handle.preset_positions == {}
+
+
 async def test_ptz_move_to_preset_gate_failure_refuses_without_awaiting(
     mock_host_factory, camera_config_factory, manager_factory
 ):

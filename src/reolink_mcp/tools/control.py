@@ -26,12 +26,15 @@ the accepted command with an explicit note instead.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Literal
 
 from mcp.server.fastmcp import Context
 
 from reolink_mcp.capabilities import gate, refusal_message
 from reolink_mcp.errors import CameraError, classify_control_error
+
+logger = logging.getLogger(__name__)
 
 # D-01/D-02: a default duration keeps "sound the siren" from producing an
 # indefinite blast, and a hard cap refuses (never clamps) any request over
@@ -359,7 +362,11 @@ async def ptz_move_to_preset(
     waits `PTZ_SETTLE_WAIT_S` for the camera to settle, then force-repolls
     pan/tilt via `host.baichuan.get_ptz_position()` (Pattern 5) and writes
     the observed position into the session-scoped `preset_positions` cache
-    (D-11's later `ptz_position` lookup, Pitfall 6)."""
+    (D-11's later `ptz_position` lookup, Pitfall 6). A failed re-poll never
+    fails the call — the physical move already succeeded — it degrades to
+    `pan`/`tilt` of `None` with an explanatory note, and the raw Baichuan
+    exception text (which embeds wire hex dumps and nonce material) stays at
+    DEBUG on stderr, never reaching the client (T-02-01, SAFE-03)."""
     manager = ctx.request_context.lifespan_context.manager
     handle = await manager.get(camera)
     if not gate(handle, "ptz_presets"):
@@ -382,18 +389,40 @@ async def ptz_move_to_preset(
             classify_control_error(exc, camera, manager.configured_host(camera))
         ) from exc
 
-    await asyncio.sleep(PTZ_SETTLE_WAIT_S)
-    await host.baichuan.get_ptz_position(ch)
-
-    pan, tilt = host.ptz_pan_position(ch), host.ptz_tilt_position(ch)
-    if pan is not None and tilt is not None:
-        handle.preset_positions[preset_id] = (pan, tilt)
-
     resolved_name = (
         preset
         if isinstance(preset, str)
         else next((n for n, i in presets.items() if i == preset_id), None)
     )
+
+    await asyncio.sleep(PTZ_SETTLE_WAIT_S)
+    try:
+        await host.baichuan.get_ptz_position(ch)
+    except Exception as exc:
+        # The physical move already succeeded — failing the whole call here
+        # would lie to the operator, and Baichuan exception messages embed
+        # raw wire content (header/data hex dumps, nonce material) that must
+        # never escape to the client (T-02-01). Degrade instead: raw detail
+        # stays at DEBUG on stderr (SAFE-03), the preset_positions cache
+        # write is skipped, and the client gets an honest note.
+        logger.debug(
+            "camera '%s' post-move position re-poll failed: %r", camera, exc
+        )
+        return {
+            "camera": camera,
+            "preset": resolved_name,
+            "pan": None,
+            "tilt": None,
+            "note": (
+                "preset move succeeded, but the post-move position re-poll "
+                "failed — pan/tilt unavailable for this call"
+            ),
+        }
+
+    pan, tilt = host.ptz_pan_position(ch), host.ptz_tilt_position(ch)
+    if pan is not None and tilt is not None:
+        handle.preset_positions[preset_id] = (pan, tilt)
+
     return {"camera": camera, "preset": resolved_name, "pan": pan, "tilt": tilt}
 
 
