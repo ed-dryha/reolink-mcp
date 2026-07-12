@@ -61,7 +61,9 @@ Decisions are logged in PROJECT.md Key Decisions table (all v1.0 decisions now c
 
 ### Pending Todos
 
-None yet.
+2 pending (v2 tool candidates, captured 2026-07-12):
+- Add set_anti_flicker tool (upstream reolink-aio first) — .planning/todos/pending/2026-07-12-add-set-anti-flicker-tool-upstream-reolink-aio-first.md
+- Add quick-reply audio playback tool (play_quick_reply) — .planning/todos/pending/2026-07-12-add-quick-reply-audio-playback-tool-play-quick-reply.md
 
 ### Blockers/Concerns
 
