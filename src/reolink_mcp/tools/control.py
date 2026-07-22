@@ -361,17 +361,153 @@ async def set_zoom(
 async def list_presets(camera: str, ctx: Context) -> dict[str, Any]:
     """List `camera`'s named PTZ presets (CTRL-06).
 
-    `host.ptz_presets(ch)` is already populated at connect time (Pattern 1 —
-    `get_host_data()`'s second internal round-trip includes `GetPtzPreset`
-    whenever `ptz_preset_basic` is supported) — a pure, synchronous read,
-    zero extra host I/O beyond the manager's own connect."""
+    Forces a fresh `GetPtzPreset` poll on every call rather than trusting
+    `host.ptz_presets(ch)`'s cached value as-is. `CameraManager` keeps one
+    `Host` alive for the whole server process (manager.py's Pattern 1) —
+    on a long-lived process, presets added/renamed/deleted out-of-band
+    (the camera's own app, `save_preset`, a different MCP session) can end
+    up invisible for the rest of that process's lifetime otherwise.
+    Confirmed live (2026-07-22/23): a preset `save_preset` had just created
+    on THIS SAME already-connected `Host` stayed absent from `list_presets`
+    indefinitely until this explicit re-poll was added — the `send_setting`
+    Set->Get auto-refetch other tools rely on (D-14) did not reliably
+    propagate here for reasons not fully root-caused; re-fetching
+    unconditionally is the robust fix regardless of the exact cause. The
+    extra round-trip is one lightweight command, not the 20-command
+    connect-time batch (abseite's timeout failure mode)."""
     manager = ctx.request_context.lifespan_context.manager
     handle = await manager.get(camera)
     if not gate(handle, "ptz_presets"):
         raise CameraError(refusal_message(camera, "ptz_presets"))
     host, ch = handle.host, handle.channel
 
+    try:
+        await host.get_state(cmd="GetPtzPreset", ch=ch)
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
+
     return {"camera": camera, "presets": host.ptz_presets(ch)}
+
+
+async def save_preset(
+    camera: str,
+    ctx: Context,
+    name: str,
+    preset_id: int | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Save `camera`'s CURRENT physical pan/tilt/zoom as a new named PTZ
+    preset — the counterpart to `ptz_move_to_preset` (which only reaches
+    *existing* presets).
+
+    `SetPtzPreset` takes no pan/tilt/zoom in its body (mirroring
+    `GetPtzPreset`, which also never exposes position — Pattern 1/CTRL-06):
+    the camera captures whatever its physical PTZ state happens to be at the
+    moment it receives the command, invisibly on the camera side. Reposition
+    the camera first (`ptz_move`/`ptz_move_to_preset`/manual nudges), then
+    call this to bookmark it.
+
+    Refuses on either kind of collision by default: `name` already present
+    in `host.ptz_presets(ch)`, or an explicitly-given `preset_id` already in
+    use by another name — both checked before any host call. With no
+    `preset_id`, one is chosen automatically as `max(existing ids) + 1`
+    (matching how the camera's own app assigns new preset slots).
+
+    `overwrite=True` is the deliberate-update escape hatch for the name
+    collision: re-saves `name`'s position under its EXISTING id instead of
+    refusing (e.g. re-centering a preset after nudging the camera).
+    `preset_id` is ignored in that path — the existing id is always reused,
+    never reassigned — and the id-collision-with-a-different-name refusal
+    still applies even with `overwrite=True`: this tool updates one named
+    preset's position, it does not reassign preset slots between names.
+
+    Unlike the PTZ movement tools, no settle-wait + Baichuan re-poll is
+    needed here: `SetPtzPreset` starts with `"Set"`, so `send_setting()`'s
+    own auto-refetch (Set->Get command-name derivation) already re-issues
+    `GetPtzPreset` and refreshes `host.ptz_presets(ch)` before this returns
+    (D-14 — same discipline as the lights/zoom read-backs, not the PtzCtrl
+    exception `ptz_move_to_preset`/`ptz_move` need)."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not gate(handle, "ptz_presets"):
+        raise CameraError(refusal_message(camera, "ptz_presets"))
+    host, ch = handle.host, handle.channel
+
+    presets = host.ptz_presets(ch)
+    if name in presets:
+        if not overwrite:
+            raise CameraError(
+                f"camera '{camera}' already has a preset named '{name}' (id "
+                f"{presets[name]}) — pass overwrite=True to update its "
+                f"position, or pick a different name"
+            )
+        resolved_id = presets[name]
+    elif preset_id is None:
+        resolved_id = max(presets.values(), default=0) + 1
+    else:
+        existing_name = next(
+            (n for n, i in presets.items() if i == preset_id), None
+        )
+        if existing_name is not None:
+            raise CameraError(
+                f"camera '{camera}' preset id {preset_id} is already used by "
+                f"'{existing_name}' — pick a different id, or delete/"
+                f"overwrite it via the camera's own app first"
+            )
+        resolved_id = preset_id
+
+    try:
+        await host.send_setting(
+            [
+                {
+                    "cmd": "SetPtzPreset",
+                    "action": 0,
+                    "param": {
+                        "PtzPreset": {
+                            "channel": ch,
+                            "enable": 1,
+                            "id": resolved_id,
+                            "name": name,
+                        }
+                    },
+                }
+            ]
+        )
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
+
+    # Belt-and-braces explicit re-poll, same rationale as list_presets: the
+    # camera-side save above already succeeded (confirmed live — the raw
+    # SetPtzPreset response code was 0/200), so a failure here degrades
+    # instead of raising — never claim the save itself failed over a
+    # read-back hiccup.
+    try:
+        await host.get_state(cmd="GetPtzPreset", ch=ch)
+    except Exception as exc:
+        logger.debug(
+            "camera '%s' post-save-preset re-poll failed: %r", camera, exc
+        )
+        return {
+            "camera": camera,
+            "preset": name,
+            "id": resolved_id,
+            "presets": presets,
+            "note": (
+                "preset save succeeded, but the post-save presets re-poll "
+                "failed — call list_presets to confirm"
+            ),
+        }
+
+    return {
+        "camera": camera,
+        "preset": name,
+        "id": resolved_id,
+        "presets": host.ptz_presets(ch),
+    }
 
 
 async def ptz_move_to_preset(
