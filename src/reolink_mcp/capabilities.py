@@ -40,6 +40,7 @@ CAPABILITY_MAP: dict[str, str] = {
     "motion_detection": "motion_detection",
     "pan_tilt": "pan_tilt",
     "ptz_guard": "ptz_guard",
+    "ptz_patrol": "ptz_patrol",
 }
 
 
