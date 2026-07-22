@@ -12,6 +12,7 @@ Pitfall 3/4 discipline guards against.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -24,8 +25,11 @@ from reolink_mcp.errors import CameraError
 from reolink_mcp.manager import CameraManager
 from reolink_mcp.tools import register_all
 from reolink_mcp.tools.control import (
+    PTZ_MOVE_DEFAULT_DURATION_S,
+    PTZ_SETTLE_WAIT_S,
     list_presets,
     ptz_guard,
+    ptz_move,
     ptz_move_to_preset,
     ptz_position,
     set_audio_alarm,
@@ -36,13 +40,15 @@ from reolink_mcp.tools.control import (
     set_zoom,
 )
 
-# Plan 03-03 Task 1 (+ checkpoint deviation): the full, final 16-tool
-# registry (6 observe + 10 control) — the literal name sets SAFE-01/SAFE-02's
+# Plan 03-03 Task 1 (+ checkpoint deviation): the full, final 17-tool
+# registry (6 observe + 11 control) — the literal name sets SAFE-01/SAFE-02's
 # hard regression tests assert against, defined once here to avoid drift
 # between the two tests. `set_audio_alarm` was added during the Plan 03-03
 # hardware checkpoint after live P437 QA found `set_siren` silently
-# suppressed while the camera's audio-alarm feature is disabled.
-_ALL_SIXTEEN_TOOL_NAMES = {
+# suppressed while the camera's audio-alarm feature is disabled. `ptz_move`
+# (raw directional pan/tilt, distinct from the fixed-target
+# `ptz_move_to_preset`) was added later as a locally-maintained fork addition.
+_ALL_SEVENTEEN_TOOL_NAMES = {
     "list_cameras",
     "get_snapshot",
     "get_device_info",
@@ -57,6 +63,7 @@ _ALL_SIXTEEN_TOOL_NAMES = {
     "set_zoom",
     "list_presets",
     "ptz_move_to_preset",
+    "ptz_move",
     "ptz_position",
     "ptz_guard",
 }
@@ -135,6 +142,18 @@ def _configure_pan_tilt_capable(
     if extra_supported:
         caps.update(extra_supported)
     host.supported = _per_string_supported(caps)
+    host.ptz_pan_position = lambda channel: pan
+    host.ptz_tilt_position = lambda channel: tilt
+
+
+def _configure_ptz_move_capable(
+    host,
+    *,
+    pan: int | None = None,
+    tilt: int | None = None,
+) -> None:
+    host.supported = _per_string_supported({"pan_tilt": True})
+    host.set_ptz_command = AsyncMock()
     host.ptz_pan_position = lambda channel: pan
     host.ptz_tilt_position = lambda channel: tilt
 
@@ -921,6 +940,222 @@ async def test_ptz_move_to_preset_gate_failure_refuses_without_awaiting(
 
 
 # ---------------------------------------------------------------------------
+# ptz_move (raw directional PTZ, locally-maintained fork addition)
+# ---------------------------------------------------------------------------
+
+
+async def test_ptz_move_sends_direction_then_stop_after_duration(
+    mock_host_factory, camera_config_factory, manager_factory, monkeypatch
+):
+    host = mock_host_factory()
+    _configure_ptz_move_capable(host, pan=50, tilt=60)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("reolink_mcp.tools.control.asyncio.sleep", sleep_mock)
+
+    result = await ptz_move("front_door", _fake_ctx(manager), direction="right")
+
+    assert host.set_ptz_command.await_args_list[0].args == (0,)
+    assert host.set_ptz_command.await_args_list[0].kwargs == {
+        "command": "Right",
+        "speed": None,
+    }
+    assert host.set_ptz_command.await_args_list[1].args == (0,)
+    assert host.set_ptz_command.await_args_list[1].kwargs == {"command": "Stop"}
+    assert result == {
+        "camera": "front_door",
+        "direction": "right",
+        "pan": 50,
+        "tilt": 60,
+    }
+
+
+async def test_ptz_move_default_duration_used_when_omitted(
+    mock_host_factory, camera_config_factory, manager_factory, monkeypatch
+):
+    host = mock_host_factory()
+    _configure_ptz_move_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("reolink_mcp.tools.control.asyncio.sleep", sleep_mock)
+
+    await ptz_move("front_door", _fake_ctx(manager), direction="up")
+
+    sleep_mock.assert_any_await(1.0)
+
+
+async def test_ptz_move_custom_duration_within_cap_used(
+    mock_host_factory, camera_config_factory, manager_factory, monkeypatch
+):
+    host = mock_host_factory()
+    _configure_ptz_move_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("reolink_mcp.tools.control.asyncio.sleep", sleep_mock)
+
+    await ptz_move("front_door", _fake_ctx(manager), direction="down", duration=3.5)
+
+    sleep_mock.assert_any_await(3.5)
+
+
+async def test_ptz_move_duration_over_cap_refused_never_sent(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_move_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await ptz_move("front_door", _fake_ctx(manager), direction="left", duration=8.1)
+
+    assert "8" in str(exc_info.value)
+    host.set_ptz_command.assert_not_awaited()
+
+
+@pytest.mark.parametrize("duration", [0, -1])
+async def test_ptz_move_duration_zero_or_negative_refused(
+    mock_host_factory, camera_config_factory, manager_factory, duration
+):
+    host = mock_host_factory()
+    _configure_ptz_move_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await ptz_move(
+            "front_door", _fake_ctx(manager), direction="left", duration=duration
+        )
+
+    assert "greater than 0" in str(exc_info.value)
+    host.set_ptz_command.assert_not_awaited()
+
+
+async def test_ptz_move_stop_direction_sends_stop_only_no_duration_wait(
+    mock_host_factory, camera_config_factory, manager_factory, monkeypatch
+):
+    host = mock_host_factory()
+    _configure_ptz_move_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr("reolink_mcp.tools.control.asyncio.sleep", sleep_mock)
+
+    result = await ptz_move("front_door", _fake_ctx(manager), direction="stop")
+
+    host.set_ptz_command.assert_awaited_once_with(0, command="Stop")
+    # the only sleep should be the post-move settle-wait, never a duration wait
+    sleep_mock.assert_awaited_once_with(PTZ_SETTLE_WAIT_S)
+    assert result["direction"] == "stop"
+
+
+async def test_ptz_move_stop_after_move_always_sent_even_if_wait_raises(
+    mock_host_factory, camera_config_factory, manager_factory, monkeypatch
+):
+    """The trailing Stop must fire even when the duration wait itself blows
+    up (e.g. the call is cancelled mid-move) — a continuous PTZ command has
+    no camera-side timeout, so skipping the stop here would leave the head
+    panning unattended."""
+    host = mock_host_factory()
+    _configure_ptz_move_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    async def failing_sleep(seconds):
+        if seconds == PTZ_MOVE_DEFAULT_DURATION_S:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr("reolink_mcp.tools.control.asyncio.sleep", failing_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await ptz_move("front_door", _fake_ctx(manager), direction="right")
+
+    assert host.set_ptz_command.await_args_list[-1].kwargs == {"command": "Stop"}
+
+
+async def test_ptz_move_speed_passed_through_unvalidated(
+    mock_host_factory, camera_config_factory, manager_factory, monkeypatch
+):
+    host = mock_host_factory()
+    _configure_ptz_move_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+    monkeypatch.setattr(
+        "reolink_mcp.tools.control.asyncio.sleep", AsyncMock()
+    )
+
+    await ptz_move("front_door", _fake_ctx(manager), direction="up", speed=32)
+
+    assert host.set_ptz_command.await_args_list[0].kwargs == {
+        "command": "Up",
+        "speed": 32,
+    }
+
+
+async def test_ptz_move_gate_failure_refuses_without_awaiting(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    host.supported = _per_string_supported({"pan_tilt": False})
+    host.set_ptz_command = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await ptz_move("front_door", _fake_ctx(manager), direction="left")
+
+    assert refusal_message("front_door", "pan_tilt") in str(exc_info.value)
+    host.set_ptz_command.assert_not_awaited()
+
+
+async def test_ptz_move_repoll_failure_degrades_never_leaks_raw_text(
+    mock_host_factory, camera_config_factory, manager_factory, monkeypatch
+):
+    host = mock_host_factory()
+    _configure_ptz_move_capable(host)
+    host.baichuan.get_ptz_position = AsyncMock(
+        side_effect=ReolinkConnectionError("baichuan header: deadbeefcafe")
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+    monkeypatch.setattr("reolink_mcp.tools.control.asyncio.sleep", AsyncMock())
+
+    result = await ptz_move("front_door", _fake_ctx(manager), direction="left")
+
+    assert result["pan"] is None
+    assert result["tilt"] is None
+    assert "re-poll" in result["note"]
+    assert "deadbeefcafe" not in str(result)
+
+
+async def test_ptz_move_trailing_stop_failure_surfaces_note(
+    mock_host_factory, camera_config_factory, manager_factory, monkeypatch
+):
+    """If the Stop call itself fails, the operator must be told explicitly —
+    a silently-swallowed Stop failure could leave the camera moving with no
+    indication anything went wrong."""
+    host = mock_host_factory()
+    _configure_ptz_move_capable(host, pan=10, tilt=20)
+
+    async def move_then_fail_stop(channel, command, speed=None):
+        if command == "Stop":
+            raise ReolinkConnectionError("baichuan header: deadbeefcafe")
+
+    host.set_ptz_command = AsyncMock(side_effect=move_then_fail_stop)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+    monkeypatch.setattr("reolink_mcp.tools.control.asyncio.sleep", AsyncMock())
+
+    result = await ptz_move("front_door", _fake_ctx(manager), direction="left")
+
+    assert "Stop" in result["note"]
+    assert "deadbeefcafe" not in str(result)
+
+
+# ---------------------------------------------------------------------------
 # ptz_position (D-11, Pattern 5)
 # ---------------------------------------------------------------------------
 
@@ -1178,13 +1413,13 @@ async def test_ptz_guard_host_error_translated_to_camera_error(
 # ---------------------------------------------------------------------------
 
 
-async def test_register_all_not_read_only_registers_sixteen_tools():
+async def test_register_all_not_read_only_registers_seventeen_tools():
     test_mcp = FastMCP("probe-annotations")
     register_all(test_mcp, read_only=False)
 
     tools = await test_mcp.list_tools()
 
-    assert len(tools) == 16
+    assert len(tools) == 17
     names = {t.name for t in tools}
     assert {
         "set_siren",
@@ -1195,6 +1430,7 @@ async def test_register_all_not_read_only_registers_sixteen_tools():
         "set_zoom",
         "list_presets",
         "ptz_move_to_preset",
+        "ptz_move",
         "ptz_position",
         "ptz_guard",
     } <= names
@@ -1217,6 +1453,7 @@ async def test_register_all_read_only_registers_six_tools_no_control_tools():
         "set_zoom",
         "list_presets",
         "ptz_move_to_preset",
+        "ptz_move",
         "ptz_position",
         "ptz_guard",
     } & names
@@ -1235,21 +1472,21 @@ async def test_register_all_exact_tool_name_sets_for_both_modes():
     register_all(read_only_mcp, read_only=True)
     read_only_names = {t.name for t in await read_only_mcp.list_tools()}
 
-    assert full_names == _ALL_SIXTEEN_TOOL_NAMES
+    assert full_names == _ALL_SEVENTEEN_TOOL_NAMES
     assert read_only_names == _SIX_OBSERVE_TOOL_NAMES
 
 
 async def test_full_registry_annotation_completeness_and_d13_matrix():
-    """SAFE-01 hard regression guard: every one of the 16 registered tools
+    """SAFE-01 hard regression guard: every one of the 17 registered tools
     (not a spot-check subset) must carry explicit, non-None
     readOnlyHint/destructiveHint/idempotentHint values, plus the D-13
     matrix invariants (destructiveHint True on set_siren only; readOnlyHint
-    True for the 6 observe tools, False for the 10 control tools)."""
+    True for the 6 observe tools, False for the 11 control tools)."""
     test_mcp = FastMCP("probe-completeness")
     register_all(test_mcp, read_only=False)
     tools = await test_mcp.list_tools()
 
-    assert {t.name for t in tools} == _ALL_SIXTEEN_TOOL_NAMES
+    assert {t.name for t in tools} == _ALL_SEVENTEEN_TOOL_NAMES
 
     for tool in tools:
         assert tool.annotations is not None, f"{tool.name} missing annotations"
@@ -1330,6 +1567,19 @@ async def test_set_zoom_registered_with_idempotent_hint_false():
 
     tools = await test_mcp.list_tools()
     tool = next(t for t in tools if t.name == "set_zoom")
+
+    assert tool.annotations is not None
+    assert tool.annotations.readOnlyHint is False
+    assert tool.annotations.destructiveHint is False
+    assert tool.annotations.idempotentHint is False
+
+
+async def test_ptz_move_registered_with_idempotent_hint_false():
+    test_mcp = FastMCP("probe-annotations")
+    register_all(test_mcp, read_only=False)
+
+    tools = await test_mcp.list_tools()
+    tool = next(t for t in tools if t.name == "ptz_move")
 
     assert tool.annotations is not None
     assert tool.annotations.readOnlyHint is False
