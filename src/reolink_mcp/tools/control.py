@@ -606,4 +606,4 @@ async def ptz_patrol(camera: str, ctx: Context, enabled: bool) -> dict[str, Any]
             classify_control_error(exc, camera, manager.configured_host(camera))
         ) from exc
 
-    return {"camera": camera, "patrol_active": host.ptz_patrol_cruising(ch)}
+    return {"camera": camera, "patrol_active": host.baichuan.ptz_patrol_cruising(ch)}

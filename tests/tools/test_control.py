@@ -156,7 +156,7 @@ def _configure_ptz_guard_capable(
 def _configure_ptz_patrol_capable(host, *, cruising: bool | None = None) -> None:
     host.supported = _per_string_supported({"ptz_patrol": True})
     host.ctrl_ptz_patrol = AsyncMock()
-    host.ptz_patrol_cruising = lambda channel: cruising
+    host.baichuan.ptz_patrol_cruising = lambda channel: cruising
 
 
 # ---------------------------------------------------------------------------
