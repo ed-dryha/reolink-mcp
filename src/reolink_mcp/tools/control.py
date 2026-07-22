@@ -577,3 +577,33 @@ async def ptz_guard(
             "return_time_s": host.ptz_guard_time(ch),
         },
     }
+
+
+async def ptz_patrol(camera: str, ctx: Context, enabled: bool) -> dict[str, Any]:
+    """Start or stop `camera`'s PTZ patrol — continuous cruising between
+    multiple points on a configured route, distinct from `ptz_guard`'s
+    single fixed home/watch position (verified live: this camera reports
+    `ptz_patrol` and `ptz_guard` as two independent capabilities).
+
+    `host.ctrl_ptz_patrol()` always targets the FIRST (and on this camera,
+    only) configured patrol route — `reolink-aio` has no per-route control,
+    only a single on/off toggle, matching the Reolink app's own single
+    "Patrol" switch per camera. It already does its own settle-wait +
+    Baichuan re-poll internally (`asyncio.sleep(1)` then
+    `get_ptz_patrol()`), so no extra repoll is needed here — unlike
+    `ptz_move`/`ptz_move_to_preset`, which own that dance themselves because
+    raw `PtzCtrl` does not."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not gate(handle, "ptz_patrol"):
+        raise CameraError(refusal_message(camera, "ptz_patrol"))
+    host, ch = handle.host, handle.channel
+
+    try:
+        await host.ctrl_ptz_patrol(ch, enabled)
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
+
+    return {"camera": camera, "patrol_active": host.ptz_patrol_cruising(ch)}

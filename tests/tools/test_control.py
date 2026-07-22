@@ -27,6 +27,7 @@ from reolink_mcp.tools.control import (
     list_presets,
     ptz_guard,
     ptz_move_to_preset,
+    ptz_patrol,
     ptz_position,
     set_audio_alarm,
     set_ir_lights,
@@ -36,13 +37,15 @@ from reolink_mcp.tools.control import (
     set_zoom,
 )
 
-# Plan 03-03 Task 1 (+ checkpoint deviation): the full, final 16-tool
-# registry (6 observe + 10 control) — the literal name sets SAFE-01/SAFE-02's
+# Plan 03-03 Task 1 (+ checkpoint deviation): the full, final 17-tool
+# registry (6 observe + 11 control) — the literal name sets SAFE-01/SAFE-02's
 # hard regression tests assert against, defined once here to avoid drift
 # between the two tests. `set_audio_alarm` was added during the Plan 03-03
 # hardware checkpoint after live P437 QA found `set_siren` silently
-# suppressed while the camera's audio-alarm feature is disabled.
-_ALL_SIXTEEN_TOOL_NAMES = {
+# suppressed while the camera's audio-alarm feature is disabled. `ptz_patrol`
+# (continuous route cruising, distinct from `ptz_guard`'s single fixed home
+# position) was added later as a locally-maintained fork addition.
+_ALL_SEVENTEEN_TOOL_NAMES = {
     "list_cameras",
     "get_snapshot",
     "get_device_info",
@@ -59,6 +62,7 @@ _ALL_SIXTEEN_TOOL_NAMES = {
     "ptz_move_to_preset",
     "ptz_position",
     "ptz_guard",
+    "ptz_patrol",
 }
 _SIX_OBSERVE_TOOL_NAMES = {
     "list_cameras",
@@ -147,6 +151,12 @@ def _configure_ptz_guard_capable(
     host.send_setting = AsyncMock()
     host.ptz_guard_enabled = lambda channel: enabled
     host.ptz_guard_time = lambda channel: return_time_s
+
+
+def _configure_ptz_patrol_capable(host, *, cruising: bool | None = None) -> None:
+    host.supported = _per_string_supported({"ptz_patrol": True})
+    host.ctrl_ptz_patrol = AsyncMock()
+    host.ptz_patrol_cruising = lambda channel: cruising
 
 
 # ---------------------------------------------------------------------------
@@ -1174,17 +1184,84 @@ async def test_ptz_guard_host_error_translated_to_camera_error(
 
 
 # ---------------------------------------------------------------------------
+# ptz_patrol (distinct from ptz_guard — continuous route cruising, not a
+# single fixed home position; locally-maintained fork addition)
+# ---------------------------------------------------------------------------
+
+
+async def test_ptz_patrol_start_calls_ctrl_ptz_patrol_true(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_patrol_capable(host, cruising=True)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await ptz_patrol("front_door", _fake_ctx(manager), enabled=True)
+
+    host.ctrl_ptz_patrol.assert_awaited_once_with(0, True)
+    assert result == {"camera": "front_door", "patrol_active": True}
+
+
+async def test_ptz_patrol_stop_calls_ctrl_ptz_patrol_false(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_patrol_capable(host, cruising=False)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await ptz_patrol("front_door", _fake_ctx(manager), enabled=False)
+
+    host.ctrl_ptz_patrol.assert_awaited_once_with(0, False)
+    assert result == {"camera": "front_door", "patrol_active": False}
+
+
+async def test_ptz_patrol_gate_failure_refuses_without_awaiting(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    host.supported = _per_string_supported({"ptz_patrol": False})
+    host.ctrl_ptz_patrol = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await ptz_patrol("front_door", _fake_ctx(manager), enabled=True)
+
+    assert refusal_message("front_door", "ptz_patrol") in str(exc_info.value)
+    host.ctrl_ptz_patrol.assert_not_awaited()
+
+
+async def test_ptz_patrol_host_error_translated_to_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_patrol_capable(host)
+    host.ctrl_ptz_patrol = AsyncMock(
+        side_effect=ReolinkConnectionError("baichuan header: deadbeefcafe")
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await ptz_patrol("front_door", _fake_ctx(manager), enabled=True)
+
+    assert "deadbeefcafe" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
 # Registration + RMCP_READ_ONLY (SAFE-02, D-13)
 # ---------------------------------------------------------------------------
 
 
-async def test_register_all_not_read_only_registers_sixteen_tools():
+async def test_register_all_not_read_only_registers_seventeen_tools():
     test_mcp = FastMCP("probe-annotations")
     register_all(test_mcp, read_only=False)
 
     tools = await test_mcp.list_tools()
 
-    assert len(tools) == 16
+    assert len(tools) == 17
     names = {t.name for t in tools}
     assert {
         "set_siren",
@@ -1197,6 +1274,7 @@ async def test_register_all_not_read_only_registers_sixteen_tools():
         "ptz_move_to_preset",
         "ptz_position",
         "ptz_guard",
+        "ptz_patrol",
     } <= names
 
 
@@ -1219,6 +1297,7 @@ async def test_register_all_read_only_registers_six_tools_no_control_tools():
         "ptz_move_to_preset",
         "ptz_position",
         "ptz_guard",
+        "ptz_patrol",
     } & names
 
 
@@ -1235,21 +1314,21 @@ async def test_register_all_exact_tool_name_sets_for_both_modes():
     register_all(read_only_mcp, read_only=True)
     read_only_names = {t.name for t in await read_only_mcp.list_tools()}
 
-    assert full_names == _ALL_SIXTEEN_TOOL_NAMES
+    assert full_names == _ALL_SEVENTEEN_TOOL_NAMES
     assert read_only_names == _SIX_OBSERVE_TOOL_NAMES
 
 
 async def test_full_registry_annotation_completeness_and_d13_matrix():
-    """SAFE-01 hard regression guard: every one of the 16 registered tools
+    """SAFE-01 hard regression guard: every one of the 17 registered tools
     (not a spot-check subset) must carry explicit, non-None
     readOnlyHint/destructiveHint/idempotentHint values, plus the D-13
     matrix invariants (destructiveHint True on set_siren only; readOnlyHint
-    True for the 6 observe tools, False for the 10 control tools)."""
+    True for the 6 observe tools, False for the 11 control tools)."""
     test_mcp = FastMCP("probe-completeness")
     register_all(test_mcp, read_only=False)
     tools = await test_mcp.list_tools()
 
-    assert {t.name for t in tools} == _ALL_SIXTEEN_TOOL_NAMES
+    assert {t.name for t in tools} == _ALL_SEVENTEEN_TOOL_NAMES
 
     for tool in tools:
         assert tool.annotations is not None, f"{tool.name} missing annotations"
@@ -1307,7 +1386,14 @@ async def test_set_siren_registered_with_destructive_hint_true():
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["set_audio_alarm", "set_spotlight", "set_ir_lights", "set_white_led", "ptz_guard"],
+    [
+        "set_audio_alarm",
+        "set_spotlight",
+        "set_ir_lights",
+        "set_white_led",
+        "ptz_guard",
+        "ptz_patrol",
+    ],
 )
 async def test_low_friction_control_tools_registered_with_destructive_hint_false(
     tool_name,
