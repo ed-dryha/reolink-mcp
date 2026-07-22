@@ -60,6 +60,28 @@ PTZ_SETTLE_WAIT_S = 2
 # preset position to report ptz_position's "at_preset" match.
 PTZ_POSITION_TOLERANCE = 40
 
+# ptz_move: a continuous PtzCtrl command (Left/Right/Up/... ) keeps the motor
+# running until an explicit "Stop" is sent — there is no camera-side auto-
+# timeout. A short default duration keeps "pan right" from spinning the head
+# indefinitely if the caller never follows up, mirroring set_siren's
+# refuse-not-clamp duration discipline (D-01/D-02) rather than the
+# relative-zoom's clamp-don't-refuse one, because an unbounded PTZ sweep can
+# walk the head into a mechanical limit or off the area of interest for far
+# longer than a clamped zoom step ever could.
+PTZ_MOVE_DEFAULT_DURATION_S = 1.0
+PTZ_MOVE_MAX_DURATION_S = 8.0
+
+_PTZ_MOVE_DIRECTIONS = {
+    "left": "Left",
+    "right": "Right",
+    "up": "Up",
+    "down": "Down",
+    "leftup": "LeftUp",
+    "leftdown": "LeftDown",
+    "rightup": "RightUp",
+    "rightdown": "RightDown",
+}
+
 
 async def set_siren(
     camera: str,
@@ -449,6 +471,135 @@ async def ptz_move_to_preset(
         handle.preset_positions[preset_id] = (pan, tilt)
 
     return {"camera": camera, "preset": resolved_name, "pan": pan, "tilt": tilt}
+
+
+async def ptz_move(
+    camera: str,
+    ctx: Context,
+    direction: Literal[
+        "left",
+        "right",
+        "up",
+        "down",
+        "leftup",
+        "leftdown",
+        "rightup",
+        "rightdown",
+        "stop",
+    ],
+    duration: float | None = None,
+    speed: int | None = None,
+) -> dict[str, Any]:
+    """Pan/tilt `camera` freehand in one of 8 compass directions, or `stop` an
+    already-moving camera immediately.
+
+    Unlike `ptz_move_to_preset` (a fixed, named target), this is a raw
+    continuous move — the same PtzCtrl command a joystick app sends while a
+    button is held down. `direction="stop"` sends the camera's `Stop` command
+    on its own and returns immediately; every other direction sends the move
+    command, holds it for `duration` seconds (`PTZ_MOVE_DEFAULT_DURATION_S`
+    if omitted, refused above `PTZ_MOVE_MAX_DURATION_S` — never silently
+    clamped, same discipline as `set_siren`'s duration bound), then always
+    sends `Stop` before returning — including when the wait itself raises
+    (e.g. the call is cancelled mid-move). A continuous PTZ command has no
+    camera-side timeout of its own, so skipping the stop on an error path
+    would leave the head panning unattended.
+
+    `speed`, if given, is passed straight to `host.set_ptz_command()`
+    unvalidated here — reolink-aio itself refuses a non-integer speed or one
+    sent to a camera that doesn't support variable PTZ speed
+    (`NotSupportedError`), which `classify_control_error()` already turns
+    into a curated message; no need to duplicate that check.
+
+    Same settle-wait + forced `host.baichuan.get_ptz_position()` re-poll as
+    `ptz_move_to_preset` (Pattern 4/5) — `PtzCtrl` never auto-refreshes
+    position. If the trailing `Stop` itself fails, the physical move may
+    still be ongoing: that failure is never swallowed silently, it is
+    surfaced as an explicit `note` on the returned dict so the caller knows
+    to check the camera by hand, while the raw exception stays at DEBUG on
+    stderr (T-02-01, SAFE-03)."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not gate(handle, "pan_tilt"):
+        raise CameraError(refusal_message(camera, "pan_tilt"))
+    host, ch = handle.host, handle.channel
+
+    if direction == "stop":
+        try:
+            await host.set_ptz_command(ch, command="Stop")
+        except Exception as exc:
+            raise CameraError(
+                classify_control_error(exc, camera, manager.configured_host(camera))
+            ) from exc
+    else:
+        resolved_duration = (
+            duration if duration is not None else PTZ_MOVE_DEFAULT_DURATION_S
+        )
+        if resolved_duration <= 0:
+            raise CameraError(
+                f"camera '{camera}' ptz_move duration {resolved_duration}s must be "
+                f"greater than 0"
+            )
+        if resolved_duration > PTZ_MOVE_MAX_DURATION_S:
+            raise CameraError(
+                f"camera '{camera}' ptz_move duration {resolved_duration}s exceeds "
+                f"the {PTZ_MOVE_MAX_DURATION_S}s safety cap — issue multiple shorter "
+                f"moves instead"
+            )
+
+        try:
+            await host.set_ptz_command(
+                ch, command=_PTZ_MOVE_DIRECTIONS[direction], speed=speed
+            )
+        except Exception as exc:
+            raise CameraError(
+                classify_control_error(exc, camera, manager.configured_host(camera))
+            ) from exc
+
+        stop_error: Exception | None = None
+        try:
+            await asyncio.sleep(resolved_duration)
+        finally:
+            try:
+                await host.set_ptz_command(ch, command="Stop")
+            except Exception as exc:
+                stop_error = exc
+                logger.debug(
+                    "camera '%s' ptz_move stop-after-move failed: %r", camera, exc
+                )
+
+    await asyncio.sleep(PTZ_SETTLE_WAIT_S)
+    try:
+        await host.baichuan.get_ptz_position(ch)
+    except Exception as exc:
+        logger.debug(
+            "camera '%s' post-move position re-poll failed: %r", camera, exc
+        )
+        result: dict[str, Any] = {
+            "camera": camera,
+            "direction": direction,
+            "pan": None,
+            "tilt": None,
+            "note": (
+                "move succeeded, but the post-move position re-poll failed — "
+                "pan/tilt unavailable for this call"
+            ),
+        }
+        if direction != "stop" and stop_error is not None:
+            result["note"] += (
+                "; the trailing Stop command also failed — verify the camera "
+                "is not still moving"
+            )
+        return result
+
+    pan, tilt = host.ptz_pan_position(ch), host.ptz_tilt_position(ch)
+    result = {"camera": camera, "direction": direction, "pan": pan, "tilt": tilt}
+    if direction != "stop" and stop_error is not None:
+        result["note"] = (
+            "the trailing Stop command failed — verify the camera is not "
+            "still moving"
+        )
+    return result
 
 
 async def ptz_position(camera: str, ctx: Context) -> dict[str, Any]:
